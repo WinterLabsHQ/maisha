@@ -101,35 +101,67 @@ def _base_fingerprint(f: "Finding") -> str:
     return compute_fingerprint(f.rule_id, f.file, f.line_content, f.context_symbol)
 
 
-def occurrence_alignment(runs: list[list["Finding"]]) -> dict[str, list[int]]:
-    """Line lists that let several analyzers number identical violations alike.
+def occurrence_alignment(runs: list[list["Finding"]]) -> dict[str, dict[int, int]]:
+    """Occurrence numbers that let several analyzers number identical violations alike.
 
     ``assign_occurrences`` numbers repeats within one analyzer's run. If tool A
     reports both of two identical lines and tool B only the second, B's lone
     finding would be occurrence 0 and merge into A's finding for the FIRST line.
-    For each group of identical violations this returns the sorted union of the
-    lines all analyzers reported, so occurrence = position in that union. It is
-    only used when the analyzers agree on how many distinct violations there are
-    (the union is as long as the largest single run's list); if they disagree on
-    where one violation is (off-by-a-line reports) alignment would invent extra
-    occurrences, so that group keeps per-analyzer numbering.
+    For each group of identical violations (same rule, file, function and
+    normalized source line) this returns a map ``line -> occurrence`` shared by
+    all analyzers.
+
+    * Analyzers that report the same lines (or a subset of them): occurrence =
+      position of the line in the union of all reported lines.
+    * Analyzers that disagree on where a violation is (multi-line statements,
+      a tool pointing at the next line): reports from different analyzers within
+      one line of each other are treated as the same violation and share one
+      occurrence number. A line reported twice by the same analyzer, or a line
+      that could belong to two different violations, makes the group truly
+      ambiguous; it then keeps per-analyzer numbering (and is omitted here).
     """
-    union: dict[str, set[int]] = {}
-    biggest: dict[str, int] = {}
+    per_run: list[dict[str, set[int]]] = []
     for run in runs:
         per: dict[str, set[int]] = {}
         for f in run:
             if f.fingerprint == _base_fingerprint(f):
                 per.setdefault(f.fingerprint, set()).add(f.line)
-        for base, lines in per.items():
-            union.setdefault(base, set()).update(lines)
-            biggest[base] = max(biggest.get(base, 0), len(lines))
-    return {base: sorted(lines) for base, lines in union.items()
-            if len(lines) == biggest[base]}
+        per_run.append(per)
+    out: dict[str, dict[int, int]] = {}
+    for base in {b for per in per_run for b in per}:
+        reports = [(idx, per[base]) for idx, per in enumerate(per_run) if base in per]
+        union = sorted(set().union(*(lines for _, lines in reports)))
+        if len(union) == max(len(lines) for _, lines in reports):
+            out[base] = {line: i for i, line in enumerate(union)}
+            continue
+        clusters = _cluster_reports(reports)
+        if clusters is not None:
+            out[base] = {line: i for i, cluster in enumerate(clusters) for line in cluster}
+    return out
+
+
+def _cluster_reports(reports: list[tuple[int, set[int]]]) -> list[list[int]] | None:
+    """Group lines reported by different analyzers (within one line of each other)
+    into violations. None when the grouping would be a guess."""
+    who: dict[int, set[int]] = {}
+    for idx, lines in reports:
+        for line in lines:
+            who.setdefault(line, set()).add(idx)
+    clusters: list[tuple[list[int], set[int]]] = []     # (lines, analyzers)
+    for line in sorted(who):
+        if clusters and line - clusters[-1][0][-1] <= 1:
+            lines, owners = clusters[-1]
+            if owners & who[line]:
+                return None     # one tool reports two neighbouring lines: ambiguous
+            lines.append(line)
+            owners |= who[line]
+        else:
+            clusters.append(([line], set(who[line])))
+    return [lines for lines, _ in clusters]
 
 
 def assign_occurrences(findings: list["Finding"],
-                       aligned: dict[str, list[int]] | None = None) -> list["Finding"]:
+                       aligned: dict[str, dict[int, int]] | None = None) -> list["Finding"]:
     """Give identical violations their own identity.
 
     Two findings of the same rule on identical (whitespace-normalized) lines in
@@ -141,8 +173,8 @@ def assign_occurrences(findings: list["Finding"],
     ones supplied by an external tool are kept verbatim.
 
     ``aligned`` (from :func:`occurrence_alignment`) numbers a finding by the
-    position of its line in the lines every analyzer reported, instead of by
-    the order within this run alone.
+    occurrence its line maps to across all analyzers, instead of by the order
+    within this run alone.
 
     Returns the findings with exact repeats removed, in their original order.
     """
@@ -163,7 +195,7 @@ def assign_occurrences(findings: list["Finding"],
             places.append(place)
             n = len(places) - 1
             if aligned and place in aligned.get(base, ()):
-                n = aligned[base].index(place)
+                n = aligned[base][place]
             if n:
                 f.fingerprint = compute_fingerprint(f.rule_id, f.file, f.line_content,
                                                     f.context_symbol, n)
