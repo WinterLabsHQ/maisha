@@ -201,7 +201,7 @@ def _knowledge_base() -> list[dict]:
 
     dead = [(rid, ref) for rid in REGISTRY.all_ids()
             for ref in REGISTRY.get(rid).get("cross", [])
-            if not REGISTRY.resolve(ref)]
+            if not REGISTRY.resolve_loose(ref)]
     external = [d for d in dead if _CERT_RECOMMENDATION.fullmatch(d[1])]
     broken = [d for d in dead if d not in external]
     out.append(_check("  cross-standard references",
