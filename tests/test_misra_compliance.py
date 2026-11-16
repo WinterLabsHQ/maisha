@@ -66,7 +66,10 @@ def test_all_violations_deviated_flips_verdict(tmp_path):
                                   approver="lead@example.com", expires_days=365)
     s = report_mod.misra_compliance_summary(eng.mem)
     assert s["counts"]["violations"] == 0
-    assert s["verdict"] == "COMPLIANT WITH DEVIATIONS"
+    # Deviations resolve the violations, but guidelines nothing examined remain,
+    # so the verdict may not say COMPLIANT (see tests/test_honest_reports.py).
+    assert s["verdict"].startswith("NO VIOLATIONS FOUND IN CHECKED GUIDELINES")
+    assert s["verdict"].endswith("WITH DEVIATIONS")
 
 
 if __name__ == "__main__":

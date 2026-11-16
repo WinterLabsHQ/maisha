@@ -31,9 +31,11 @@ def test_gep_records_tool_inventory_and_coverage(tmp_path):
     assert cv["carried"] == len(REGISTRY.all_ids("MISRA-C:2012"))
     assert cv["detectable"] <= cv["carried"]
     assert gep["not_checked"] > 0
-    # every enforced guideline gets a method + at least one checking tool
-    assert gep["guidelines"] and all(r["method"] == "Static analysis" for r in gep["guidelines"])
-    assert all(r["checked_by"] for r in gep["guidelines"])
+    # every row names how it is enforced; reference-only rows say plainly that
+    # tooling does not enforce them (see tests/test_honest_reports.py for detail)
+    assert gep["guidelines"]
+    assert all(r["method"] for r in gep["guidelines"])
+    assert any(r["method"] == "Static analysis" and r["checked_by"] for r in gep["guidelines"])
     # a guideline with an observed finding is marked as observed, not just configured
     observed = [r for r in gep["guidelines"] if r["evidence"].startswith("observed")]
     assert observed, "no guideline showed observed detection evidence"
