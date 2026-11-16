@@ -97,10 +97,31 @@ BANNED_CALLS = {
 }
 
 _CALL_RE = re.compile(r"\b(" + "|".join(BANNED_CALLS) + r")\s*\(")
+# Text before a banned name that shows it is NOT a call to the library function:
+#   * member access (`obj->free(x)`, `ops.system()`), a struct field that merely
+#     shares the name;
+#   * a declaration or definition (`void *signal(int);`): one or more
+#     type-ish words/stars from the start of the line, none of them a keyword
+#     that can precede a real call (`return free(p)`, `else exit(1)`);
+#   * the macro being defined (`#define free(p) my_free(p)`).
+_MEMBER_PREFIX_RE = re.compile(r"(?:\.|->)\s*$")
+_DECL_PREFIX_RE = re.compile(r"^\s*(?:[A-Za-z_]\w*[\s*]+)+$")
+_DEFINE_PREFIX_RE = re.compile(r"^\s*#\s*(?:define|undef)\s+$")
+_CALL_KEYWORDS = frozenset({"return", "else", "do", "case", "goto", "sizeof"})
+
+
+def _is_library_call(line: str, m: "re.Match[str]") -> bool:
+    """True when the banned-name match at `m` is a call, not a member or a declaration."""
+    prefix = line[:m.start()]
+    if _MEMBER_PREFIX_RE.search(prefix) or _DEFINE_PREFIX_RE.match(prefix):
+        return False
+    if _DECL_PREFIX_RE.match(prefix):
+        return bool(set(re.findall(r"[A-Za-z_]\w*", prefix)) & _CALL_KEYWORDS)
+    return True
 _OCTAL_RE = re.compile(r"(?<![\w.])0[0-7]+(?![\dxXbB.eEuUlL'])")
 _LSUFFIX_RE = re.compile(r"\b\d+[uU]?l\b")
 _ASSIGN_COND_RE = re.compile(r"\b(if|while)\s*\(([^()]|\([^()]*\))*[^=!<>+\-*/%&|^]=(?!=)")
-_NOBRACE_RE = re.compile(r"^\s*(if|else\s+if|for|while)\s*\(.*\)\s*[^{;\s].*;\s*$")
+_CTRL_OPEN_RE = re.compile(r"^\s*(if|else\s+if|for|while)\s*\(")
 _ELSE_NOBRACE_RE = re.compile(r"^\s*else\s+(?!if\b)(?!\{)[^{;\s].*;\s*$")
 _CTRL_HDR_RE = re.compile(r"^\s*(if|else\s+if|for|while)\s*\(.*\)\s*$")
 _ELSE_HDR_RE = re.compile(r"^\s*else\s*$")
@@ -331,6 +352,67 @@ def _next_significant(lines: list[str], start_idx: int) -> str | None:
     while j < len(lines) and (not lines[j].strip() or _PREPROC_RE.match(lines[j])):
         j += 1
     return lines[j] if j < len(lines) else None
+
+
+def _is_do_while_tail(lines: list[str], idx: int) -> bool:
+    """True when line `idx` (0-based) is `while (cond);` closing a `do { } while`.
+
+    Such a line is a loop terminator, not a loop with an empty body. It is told
+    apart by walking back from the `}` that precedes it to the matching `{` and
+    checking that a `do` sits in front of that brace.
+    """
+    depth = 0
+    j = idx - 1
+    while j >= 0 and not lines[j].strip():
+        j -= 1
+    if j < 0 or not lines[j].rstrip().endswith("}"):
+        return False
+    for k in range(j, -1, -1):
+        text = lines[k]
+        for c in reversed(text):
+            if c == "}":
+                depth += 1
+            elif c == "{":
+                depth -= 1
+                if depth == 0:
+                    before = text[:text.rfind("{")].rstrip()
+                    m = k
+                    while not before and m > 0:   # brace on its own line
+                        m -= 1
+                        before = lines[m].rstrip()
+                    return re.search(r"(?:^|[^\w])do$", before) is not None
+    return False
+
+
+def _braceless_body(lines: list[str], idx: int) -> bool:
+    """Rule 15.6: does line `idx` (0-based) hold a control header whose body
+    is a single non-compound statement on the same line?
+
+    The header's closing parenthesis is found by balanced matching. A greedy
+    regex backtracked onto an inner `)`, so `while (f(a) && g(b));` was read as
+    a header ending at `f(a)` with a body of `) && g(b)`. An empty body
+    (`while (x);`, `for (;;);`) is a violation too: `;` is not a compound
+    statement, and MISRA's compliant form is `while (x) { }`. The exception is
+    the `while (x);` that terminates a `do { } while`.
+    """
+    line = lines[idx]
+    m = _CTRL_OPEN_RE.match(line)
+    if not m:
+        return False
+    depth = 0
+    for pos in range(m.end() - 1, len(line)):
+        if line[pos] == "(":
+            depth += 1
+        elif line[pos] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+    else:
+        return False          # header continues on a later line
+    body = line[pos + 1:].strip()
+    if body == ";":
+        return not (m.group(1) == "while" and _is_do_while_tail(lines, idx))
+    return bool(body) and body[0] not in "{;" and body.endswith(";")
 
 
 class NativeAnalyzer(Analyzer):
@@ -605,6 +687,8 @@ class NativeAnalyzer(Analyzer):
             raw = raw_lines[i - 1] if i <= len(raw_lines) else ""
 
             for m in _CALL_RE.finditer(line):
+                if not _is_library_call(line, m):
+                    continue
                 fn = m.group(1)
                 rule, why = BANNED_CALLS[fn]
                 add(rule, i, f"call to banned function '{fn}' ({why})")
@@ -614,7 +698,7 @@ class NativeAnalyzer(Analyzer):
                 add("MISRA 7.3", i, "lowercase 'l' literal suffix is easily misread as '1'")
             if _ASSIGN_COND_RE.search(line):
                 add("MISRA 13.4", i, "assignment used inside a condition expression")
-            if _NOBRACE_RE.match(line) or _ELSE_NOBRACE_RE.match(line):
+            if _braceless_body(clean_lines, i - 1) or _ELSE_NOBRACE_RE.match(line):
                 add("MISRA 15.6", i, "control statement body is not a compound (braced) block")
             # header on one line, braceless body on the next — skip over any
             # #if/#else/#endif between the header and its real body first.

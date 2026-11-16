@@ -50,6 +50,14 @@ All notable changes to Maisha are documented here. Format loosely follows
   recategorizations, `approval_source` on findings, `proposals` and `audit_log` tables.
 
 ### Fixed
+- **Native banned-call false positives.** Member access (`obj->free(x)`, `ops.system()`),
+  declarations/definitions of a banned name (`char *strcpy(char *, const char *);`) and
+  the macro being defined (`#define free(p) ...`) no longer count as calls to the library
+  function. Real calls (`return free(p)`, `else exit(1)`) are still reported.
+- **Native Rule 15.6 header parsing.** Control-statement headers are matched with balanced
+  parentheses, so a `do { } while (f(a) && g(b));` tail on its own line is no longer
+  reported as a braceless body, and `if (g(a)) { a++;` is not treated as braceless. An
+  empty body (`while (x);`, `for (;;);`) is reported as 15.6 (`;` is not a compound statement).
 - The CLI reports expected errors (unknown session id, invalid argument) as `error: ...`
   with exit 1 instead of a traceback; `scan --analyzers` tolerates spaces.
 - `search_notes` / `memory_search` treat `%` and `_` literally instead of as LIKE wildcards.
