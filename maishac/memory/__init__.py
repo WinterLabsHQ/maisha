@@ -138,8 +138,19 @@ class MemoryStore:
         self.db.row_factory = sqlite3.Row
         # WAL lets a reader and a writer coexist, so a CI scan and a local
         # session on the same .maishac/memory.db don't block each other as hard.
-        self.db.execute("PRAGMA journal_mode=WAL")
+        # busy_timeout must be set BEFORE the WAL switch: switching a brand-new
+        # database to WAL needs a lock, and concurrent first-time opens used to
+        # fail with "database is locked" because no busy handler was installed
+        # yet. The switch is also retried, as SQLite can still return BUSY for it.
         self.db.execute("PRAGMA busy_timeout=5000")
+        for attempt in range(5):
+            try:
+                self.db.execute("PRAGMA journal_mode=WAL")
+                break
+            except sqlite3.OperationalError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
         self.db.executescript(_SCHEMA)
         self._migrate()
         self.db.commit()
