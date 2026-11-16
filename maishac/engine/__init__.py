@@ -121,14 +121,21 @@ def _parse_expiry(expires_days, expires) -> tuple[float | None, str]:
     return at, ""
 
 
-def _kill_tree(proc: subprocess.Popen) -> None:
-    """Kill the test command AND everything it spawned."""
+def _kill_tree(proc: subprocess.Popen, *, os_name: str | None = None,
+               run=None, killpg=None) -> None:
+    """Kill the test command AND everything it spawned.
+
+    ``os_name``, ``run`` and ``killpg`` are injectable so the Windows branch
+    can be unit-tested on any platform."""
+    os_name = os.name if os_name is None else os_name
+    run = subprocess.run if run is None else run
+    killpg = getattr(os, "killpg", None) if killpg is None else killpg
     try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=30)
+        if os_name == "nt":
+            run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=30)
         else:
-            os.killpg(proc.pid, signal.SIGKILL)
+            killpg(proc.pid, signal.SIGKILL)
     except (OSError, subprocess.SubprocessError):
         pass
     try:
