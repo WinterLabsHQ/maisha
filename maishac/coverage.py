@@ -21,16 +21,12 @@ clang-tidy is not a promise it fires on a given construct.
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
-
 from .rules import REGISTRY
 from .analyzers.cppcheck import CPPCHECK_TO_CERT, CPPCHECK_MISRA_IMPLEMENTED
 from .analyzers.clang_tidy import CLANG_TIDY_CERT_RULES
 from .analyzers.compiler import WFLAG_TO_RULE
+from .analyzers.native import NATIVE_RULES
 
-_NATIVE_SRC = Path(__file__).resolve().parent / "analyzers" / "native.py"
-_RULE_QUERY = re.compile(r'"((?:MISRA|CERT|BARR)[^"]*)"')
 
 # Rules where the native check implements a real but *partial* subset of what the
 # guideline requires. MISRA Compliance:2020 requires a Guideline Enforcement Plan
@@ -49,14 +45,15 @@ NATIVE_PARTIAL = {
 
 
 def native_ids() -> set[str]:
-    """Canonical ids the native analyzer can emit, read from its own source.
+    """Canonical ids the native analyzer can emit.
 
-    Deliberately derived from the code rather than hand-listed: adding a check
-    to native.py updates the coverage table and the tier split automatically,
-    so a new detector can't ship while the docs still say 'not detected'.
+    Read from the analyzer's explicit `NATIVE_RULES` registry. The analyzer
+    refuses to emit a rule that is not in it, and a test compares the registry
+    with the checks written in native.py, so adding a detector updates the
+    coverage table and the tier split without anyone hand-editing a second list.
     """
     ids = set()
-    for q in _RULE_QUERY.findall(_NATIVE_SRC.read_text("utf-8")):
+    for q in NATIVE_RULES:
         meta = REGISTRY.resolve(q)
         if meta:
             ids.add(meta["id"])

@@ -116,3 +116,38 @@ def test_braced_body_opening_on_header_line_is_not_15_6(tmp_path):
         "}\n"
     )
     assert _lines(_scan(code, tmp_path), "15.6") == []
+
+
+# --------------------------------------------------------- 27: NATIVE_RULES registry
+_QUERY_RE = re.compile(r'"((?:MISRA|CERT|BARR) [^"\n]*)"')
+
+
+def test_native_rules_registry_matches_checks_in_source():
+    """Every rule query written in native.py is registered, and vice versa.
+
+    The scan lives in the test only; coverage.native_ids() reads the registry.
+    """
+    src = Path(native.__file__).read_text("utf-8")
+    written = set(_QUERY_RE.findall(src))
+    assert written, "source scan found nothing; the pattern is stale"
+    assert written == set(native.NATIVE_RULES), (
+        sorted(written - native.NATIVE_RULES), sorted(native.NATIVE_RULES - written))
+
+
+def test_every_registered_rule_resolves_in_the_kb():
+    from maishac.rules import REGISTRY
+    assert [q for q in native.NATIVE_RULES if REGISTRY.resolve(q) is None] == []
+
+
+def test_coverage_native_ids_reads_the_registry_not_the_source():
+    from maishac import coverage
+    from maishac.rules import REGISTRY
+    assert coverage.native_ids() == {REGISTRY.resolve(q)["id"] for q in native.NATIVE_RULES}
+    assert not hasattr(coverage, "_NATIVE_SRC")
+
+
+def test_analyzer_refuses_an_unregistered_rule(tmp_path):
+    import pytest
+    a = NativeAnalyzer()
+    with pytest.raises(ValueError):
+        a._mk("MISRA 1.1", tmp_path / "x.c", tmp_path, 1, ["int x;"], "x")

@@ -96,6 +96,29 @@ BANNED_CALLS = {
     "vsprintf": ("CERT STR31-C", "unbounded format"),
 }
 
+# Every rule query the native analyzer can emit. This is the registry that
+# maishac.coverage reads to decide which rules are "detected" (COVERAGE.md, the
+# enforced/reference split), so it must be edited together with any check that
+# is added or removed. Findings are only ever created through `_mk`, which
+# rejects a query missing from this set, and tests/test_native_quality.py checks
+# the set against the queries written in this file in both directions.
+NATIVE_RULES = frozenset({
+    # MISRA C:2012 directives
+    "MISRA Dir 4.4", "MISRA Dir 4.6",
+    # MISRA C:2012 rules
+    "MISRA 4.2", "MISRA 7.1", "MISRA 7.3", "MISRA 12.5", "MISRA 13.4",
+    "MISRA 13.6", "MISRA 15.1", "MISRA 15.6", "MISRA 16.2", "MISRA 16.4",
+    "MISRA 16.5", "MISRA 16.6", "MISRA 17.2", "MISRA 17.6", "MISRA 18.8",
+    "MISRA 19.2", "MISRA 20.2", "MISRA 20.3", "MISRA 20.5", "MISRA 20.10",
+    "MISRA 20.11", "MISRA 20.13", "MISRA 20.14", "MISRA 21.3", "MISRA 21.4",
+    "MISRA 21.5", "MISRA 21.6", "MISRA 21.8", "MISRA 21.9",
+    # CERT C
+    "CERT CON33-C", "CERT ENV33-C", "CERT ERR34-C", "CERT FLP37-C",
+    "CERT MSC32-C", "CERT MSC33-C", "CERT STR31-C",
+    # BARR-C:2018
+    "BARR 3.1a", "BARR 3.2a",
+})
+
 _CALL_RE = re.compile(r"\b(" + "|".join(BANNED_CALLS) + r")\s*\(")
 # Text before a banned name that shows it is NOT a call to the library function:
 #   * member access (`obj->free(x)`, `ops.system()`), a struct field that merely
@@ -440,6 +463,8 @@ class NativeAnalyzer(Analyzer):
     # ---------------------------------------------------------------- helpers
     def _mk(self, rule_query: str, f: Path, root: Path, lineno: int,
             lines: list[str], msg: str) -> Finding | None:
+        if rule_query not in NATIVE_RULES:
+            raise ValueError(f"native check reports {rule_query!r}, which is not in NATIVE_RULES")
         meta = REGISTRY.resolve(rule_query)
         if not meta:
             return None

@@ -84,6 +84,10 @@ All notable changes to Maisha are documented here. Format loosely follows
   before, so existing fingerprints stay valid).
 
 ### Changed
+- `coverage.native_ids()` reads an explicit `NATIVE_RULES` registry in `maishac/analyzers/native.py`
+  instead of regex-scanning the analyzer's source. The analyzer raises if a check reports a rule
+  that is not registered, and a test compares the registry with the queries in the source.
+  `COVERAGE.md` is unchanged.
 - Native analyzer: removed dead Rule 15.2 bookkeeping (no-op `_resolve_gotos`, unused goto/label
   tables and regexes) and stale comments; detections unchanged. Rule 15.2 stays documented as
   not implemented natively.
