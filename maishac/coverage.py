@@ -169,6 +169,23 @@ def toolchain_status(selected: list[str] | None = None) -> dict:
     }
 
 
+def toolchain_snapshot(status: dict) -> dict:
+    """`toolchain_status()` plus the version string of every installed analyzer,
+    for the scan log. Kept out of toolchain_status itself because that runs on
+    every report and must not spawn subprocesses; this runs once per scan."""
+    from .analyzers import ALL_ANALYZERS
+
+    versions = {}
+    for cls in ALL_ANALYZERS:
+        an = cls()
+        if an.name in status["installed"]:
+            try:
+                versions[an.name] = an.version()
+            except Exception as e:  # a broken --version must not fail a scan
+                versions[an.name] = f"unknown ({type(e).__name__})"
+    return {**status, "versions": versions}
+
+
 def toolchain_warning(status: dict) -> str:
     """One-paragraph, human-readable version of a degraded toolchain, or ''.
 

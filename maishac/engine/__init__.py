@@ -85,7 +85,7 @@ class LoopEngine:
              gate: bool = False, include_paths: list[str] | None = None,
              exclude: list[str] | None = None, default_excludes: bool = True,
              std: str | None = None, compiler_flags: list[str] | None = None,
-             compile_commands: str | None = None) -> dict:
+             compile_commands: str | None = None, kind: str = "scan") -> dict:
         flags = validate_compiler_flags(compiler_flags)
         options = {"std": std, "compiler_flags": flags, "compile_commands": compile_commands}
         sr = run_scan_detailed(paths, self.root, analyzers, include_paths,
@@ -102,6 +102,10 @@ class LoopEngine:
         from ..coverage import analyzer_failure_warning, toolchain_status, toolchain_warning
         tc = toolchain_status(analyzers)
         errors = sr.errors
+        # Scan log: what this run did and did not check, for reports.
+        from ..coverage import toolchain_snapshot
+        self.mem.record_scan(kind, list(paths), len(scanned), used, errors,
+                             toolchain_snapshot(tc), bool(tc["degraded"] or errors))
         out = {
             "analyzers_used": used,
             "files_scanned": len(scanned),
@@ -142,6 +146,9 @@ class LoopEngine:
                 carried += 1
         diff = self.mem.sync_scan(findings, [], producers=set())
         tools = sorted({f.analyzer for f in findings})
+        # Imports run no analyzer here, so there is no toolchain to snapshot;
+        # the row records provenance only and is not an analysis run.
+        self.mem.record_scan("import", [str(path)], 0, tools, [], {}, False)
         return {
             "source": str(path),
             "tools": tools,
@@ -342,7 +349,7 @@ class LoopEngine:
         cfg = sess["config"]
         policy = self._policy(cfg)
         result = self.scan(cfg["paths"], cfg.get("analyzers"), gate=policy != "analyzer_only",
-                           **self._scan_kwargs(cfg))
+                           kind="verify", **self._scan_kwargs(cfg))
         analyzer_errors = result["analyzer_errors"]
         iteration = sess["iteration"] + 1
         history = sess["history"]

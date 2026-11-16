@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS findings (
   severity TEXT,
   file TEXT,
   line INTEGER,
+  "column" INTEGER,              -- 1-based start column when the analyzer reports one (0/NULL = unknown)
   message TEXT,
   analyzer TEXT,
   line_content TEXT,
@@ -124,9 +125,28 @@ CREATE TABLE IF NOT EXISTS sessions (
   started REAL NOT NULL,
   updated REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS scans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts REAL NOT NULL,
+  kind TEXT NOT NULL,              -- scan|verify|import
+  paths TEXT,                      -- JSON list of requested paths (import: the SARIF file)
+  files_scanned INTEGER NOT NULL DEFAULT 0,
+  analyzers_used TEXT,             -- JSON list: analyzers that ran and produced a usable result
+  analyzers_failed TEXT,           -- JSON list of {analyzer,status,error,files_not_analyzed}
+  toolchain TEXT,                  -- JSON snapshot: toolchain_status() plus analyzer versions
+  degraded INTEGER NOT NULL DEFAULT 0,  -- 1 if a tool was missing/deselected or an analyzer failed
+  maishac_version TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status);
 CREATE INDEX IF NOT EXISTS idx_attempts_fp ON fix_attempts(fingerprint);
 """
+
+
+# PRAGMA user_version of a fully migrated database. 0 = created before
+# versioning existed (or brand new, before _migrate stamps it).
+#   1: (implicit) verification-gate columns on findings
+#   2: findings."column", scans table
+SCHEMA_VERSION = 2
 
 
 class MemoryStore:
@@ -161,9 +181,13 @@ class MemoryStore:
         for name, ddl in [("semantic_risk", "INTEGER NOT NULL DEFAULT 0"),
                           ("analyzer_cleared_at", "REAL"), ("verification_method", "TEXT"),
                           ("approved_by", "TEXT"), ("approved_at", "REAL"),
-                          ("code_flow", "TEXT")]:
-            if name not in cols:
+                          ("code_flow", "TEXT"), ('"column"', "INTEGER")]:
+            if name.strip('"') not in cols:
                 self.db.execute(f"ALTER TABLE findings ADD COLUMN {name} {ddl}")
+        # `scans` is created by _SCHEMA (CREATE TABLE IF NOT EXISTS), which also
+        # runs against old databases. Just stamp the version.
+        if self.db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+            self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     # ------------------------------------------------------------ scan sync
     def sync_scan(self, findings: list[Finding], scanned_files: list[str],
@@ -215,10 +239,10 @@ class MemoryStore:
             if fp not in known:
                 self.db.execute(
                     """INSERT INTO findings (fingerprint, rule_id, standard, severity, file,
-                       line, message, analyzer, line_content, context_symbol, fix_hint,
-                       code_flow, status, semantic_risk, first_seen, last_seen)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (fp, f.rule_id, f.standard, f.severity, f.file, f.line, f.message,
+                       line, "column", message, analyzer, line_content, context_symbol,
+                       fix_hint, code_flow, status, semantic_risk, first_seen, last_seen)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (fp, f.rule_id, f.standard, f.severity, f.file, f.line, f.column, f.message,
                      f.analyzer, f.line_content, f.context_symbol, f.fix_hint,
                      json.dumps(f.code_flow) if f.code_flow else None,
                      status, int(semantic_risk(f.rule_id, f.line_content)), now, now))
@@ -231,9 +255,10 @@ class MemoryStore:
                 regressed = prev["status"] == "resolved" and status == "open"
                 new_status = "regressed" if regressed else status
                 self.db.execute(
-                    """UPDATE findings SET status=?, line=?, seen_count=seen_count+1,
-                       last_seen=?, regress_count=regress_count+? WHERE fingerprint=?""",
-                    (new_status, f.line, now, 1 if regressed else 0, fp))
+                    """UPDATE findings SET status=?, line=?, "column"=?,
+                       seen_count=seen_count+1, last_seen=?,
+                       regress_count=regress_count+? WHERE fingerprint=?""",
+                    (new_status, f.line, f.column, now, 1 if regressed else 0, fp))
                 if regressed:
                     diff["regressed"].append(fp)
                 elif status == "open":
@@ -268,6 +293,44 @@ class MemoryStore:
                     diff["resolved"].append(fp)
         self.db.commit()
         return diff
+
+    # ----------------------------------------------------------------- scans
+    def record_scan(self, kind: str, paths: list[str], files_scanned: int,
+                    analyzers_used: list[str], analyzers_failed: list[dict],
+                    toolchain: dict, degraded: bool) -> int:
+        """Append one row to the scan log (kind: scan|verify|import). This is the
+        evidence reports use to say what the last analysis did and did not check."""
+        from .. import __version__
+        cur = self.db.execute(
+            "INSERT INTO scans (ts, kind, paths, files_scanned, analyzers_used,"
+            " analyzers_failed, toolchain, degraded, maishac_version)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (time.time(), kind, json.dumps(paths), files_scanned,
+             json.dumps(analyzers_used), json.dumps(analyzers_failed),
+             json.dumps(toolchain), int(bool(degraded)), __version__))
+        self.db.commit()
+        return cur.lastrowid
+
+    @staticmethod
+    def _scan_row(r) -> dict:
+        d = dict(r)
+        for k in ("paths", "analyzers_used", "analyzers_failed", "toolchain"):
+            d[k] = json.loads(d[k]) if d.get(k) else ([] if k != "toolchain" else {})
+        d["degraded"] = bool(d["degraded"])
+        return d
+
+    def last_scan(self, kinds: tuple[str, ...] = ("scan", "verify")) -> Optional[dict]:
+        """Most recent recorded analysis run. Defaults to runs that executed
+        analyzers; pass kinds=("import",) for the last SARIF import."""
+        q = ",".join("?" * len(kinds))
+        r = self.db.execute(
+            f"SELECT * FROM scans WHERE kind IN ({q}) ORDER BY id DESC LIMIT 1",
+            kinds).fetchone()
+        return self._scan_row(r) if r else None
+
+    def scans(self, limit: int = 20) -> list[dict]:
+        return [self._scan_row(r) for r in self.db.execute(
+            "SELECT * FROM scans ORDER BY id DESC LIMIT ?", (limit,))]
 
     # ------------------------------------------------------------- lifecycle
     def open_findings(self, limit: int = 200, severities: list[str] | None = None) -> list[dict]:
