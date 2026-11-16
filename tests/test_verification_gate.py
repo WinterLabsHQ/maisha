@@ -2,17 +2,14 @@
 until a passing test run or a human confirms it (backlog §1/§5)."""
 
 import sys
-from pathlib import Path
 
 from maishac.engine import LoopEngine
 from maishac.memory import semantic_risk
 
-# Cross-platform always-pass / always-fail test commands. The engine runs the
-# configured test_command through subprocess with shell=True, which resolves to
-# cmd.exe on Windows and /bin/sh on POSIX. The Unix shell builtins `true`/`false`
-# are NOT cmd.exe commands, so hard-coding them makes these tests pass only where
-# a `true`/`false` executable happens to be on PATH (Linux, Git Bash) and fail on
-# a bare Windows shell. Driving the current interpreter is portable everywhere.
+# Cross-platform always-pass / always-fail test commands. The engine splits the
+# configured test_command with shlex and runs it WITHOUT a shell, so these must be
+# real executables: the Unix `true`/`false` binaries are not available on a bare
+# Windows machine. Driving the current interpreter is portable everywhere.
 PASS_CMD = f'"{sys.executable}" -c "raise SystemExit(0)"'
 FAIL_CMD = f'"{sys.executable}" -c "raise SystemExit(1)"'
 
@@ -94,7 +91,7 @@ def test_human_approval_resolves(tmp_path):
 def test_cannot_approve_a_still_detected_finding(tmp_path):
     proj = _proj(tmp_path, RISKY)
     eng = LoopEngine(proj)
-    sess = eng.begin_session(["src"], {"analyzers": ["native"]})
+    eng.begin_session(["src"], {"analyzers": ["native"]})
     fp = _find(eng, "15.6")["fingerprint"]
     # do NOT fix it — still open/detected
     assert "error" in eng.approve(fp, "lead-eng")

@@ -12,14 +12,16 @@ Run:  maishac --project /path/to/project serve
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import os
+import threading
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from .engine import LoopEngine
-from .memory import MemoryStore, MandatoryRuleError
+from .engine import LoopEngine, agent_approvals_allowed
 from .rules import REGISTRY
 from . import report as report_mod
 
@@ -29,18 +31,43 @@ mcp = FastMCP(
         "Maisha is a compliance harness for MISRA C:2012, BARR-C:2018 and CERT C. "
         "Typical flow: compliance_begin_session -> compliance_next_batch -> "
         "(compliance_record_attempt, edit code) -> compliance_verify -> repeat until "
-        "converged. Use compliance_explain_rule for guidance, memory_* tools to persist "
+        "converged. Approvals, deviations, suppressions and re-categorizations you "
+        "request are only PROPOSALS that a human must accept with the maishac CLI. "
+        "Use compliance_explain_rule for guidance, memory_* tools to persist "
         "project knowledge, and compliance_report for an auditable summary."),
 )
 
 _ENGINE: LoopEngine | None = None
+
+# One tool body runs at a time. Tool bodies are blocking (scans spawn compilers
+# and analyzers, verify can run a test command), so they execute on a worker
+# thread to keep the MCP event loop responsive; this lock serializes them so the
+# single shared SQLite connection (opened with check_same_thread=False) is never
+# used by two threads at once.
+_LOCK = threading.Lock()
+
+
+def _tool(fn):
+    """Register ``fn`` as an MCP tool that runs off the event loop under _LOCK.
+
+    The plain synchronous function is returned unchanged, so it stays directly
+    callable (the in-process tests and any embedding code call it that way)."""
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        def run():
+            with _LOCK:
+                return fn(*args, **kwargs)
+        return await asyncio.to_thread(run)
+
+    mcp.tool()(wrapper)
+    return fn
 
 
 def _engine() -> LoopEngine:
     global _ENGINE
     if _ENGINE is None:
         root = os.environ.get("MAISHAC_PROJECT", os.getcwd())
-        _ENGINE = LoopEngine(root)
+        _ENGINE = LoopEngine(root, source="mcp")
     return _ENGINE
 
 
@@ -48,21 +75,102 @@ def _j(obj) -> str:
     return json.dumps(obj, indent=2, default=str)
 
 
+def outside_project_allowed() -> bool:
+    """MAISHAC_ALLOW_OUTSIDE_PROJECT=1 lets tool arguments name paths outside the
+    project root (unsafe for an agent-driven server: it can read arbitrary files)."""
+    return os.environ.get("MAISHAC_ALLOW_OUTSIDE_PROJECT", "").strip() == "1"
+
+
+_INCLUDE_FLAGS = ("-isystem", "-iquote", "-I")
+
+
+def _confine_error(what: str, value: str, root: Path) -> str:
+    return (f"{what} '{value}' is outside the project root ({root}). The MCP server only "
+            "reads inside the project; set MAISHAC_ALLOW_OUTSIDE_PROJECT=1 on the server "
+            "to lift this restriction.")
+
+
+def _confinement_error(*, paths=None, include_paths=None, exclude=None,
+                       compiler_flags=None, files=None) -> str:
+    """Error text if any path-like argument escapes the project root, else ''.
+
+    ``paths``/``include_paths``/``files`` are paths (relative ones are resolved
+    under the root); ``exclude`` are fnmatch patterns, which may not be absolute
+    or contain '..'; include flags in ``compiler_flags`` are checked like paths."""
+    if outside_project_allowed():
+        return ""
+    root = _engine().root
+
+    def inside(value) -> bool:
+        if not isinstance(value, str):
+            return True            # engine validation reports the wrong type
+        p = Path(value)
+        full = (p if p.is_absolute() else root / p).resolve()
+        return full == root or root in full.parents
+
+    for what, group in (("path", paths), ("include path", include_paths), ("file", files)):
+        for v in group or []:
+            if not inside(v):
+                return _confine_error(what, v, root)
+    for pat in exclude or []:
+        if isinstance(pat, str) and (
+                Path(pat).is_absolute() or pat.startswith(("/", "\\"))
+                or ".." in pat.replace("\\", "/").split("/")):
+            return _confine_error("exclude pattern", pat, root)
+    for flag in compiler_flags or []:
+        if not isinstance(flag, str):
+            continue
+        for pre in _INCLUDE_FLAGS:
+            if flag.startswith(pre) and len(flag) > len(pre):
+                if not inside(flag[len(pre):]):
+                    return _confine_error("include flag", flag, root)
+                break
+    return ""
+
+
+def _signoff(kind: str, direct, **args) -> str:
+    """Route a sign-off tool call. By default the agent only *proposes*: the
+    change is recorded as pending_human and takes effect when a person runs
+    `maishac proposals accept`. MAISHAC_ALLOW_AGENT_APPROVALS=1 (unsafe) applies
+    it directly, recorded with source=mcp and flagged in reports."""
+    if agent_approvals_allowed():
+        return _j(direct(**args))
+    return _j(_engine().propose(kind, **args))
+
+
 # ------------------------------------------------------------------ scanning
-@mcp.tool()
+@_tool
 def compliance_scan(paths: list[str], analyzers: list[str] | None = None,
-                    include_paths: list[str] | None = None) -> str:
+                    include_paths: list[str] | None = None,
+                    exclude: list[str] | None = None,
+                    std: str | None = None,
+                    compiler_flags: list[str] | None = None,
+                    compile_commands: str | None = None) -> str:
     """Scan C files/directories for MISRA C, BARR-C and CERT C violations and
     sync results into persistent project memory.
 
     Args:
         paths: Files or directories, relative to the project root (e.g. ["src"]).
-        analyzers: Optional subset of ["native", "cppcheck", "clang-tidy"].
-            Default: every analyzer installed on this machine.
-        include_paths: Header search dirs forwarded to cppcheck/clang-tidy as -I.
-            Without these, headers outside `paths` (e.g. a project's config.h)
-            are invisible to those analyzers and they misreport "undefined
-            identifier"/"file not found" false positives instead of real defects.
+            Paths outside the project root are rejected unless the server was
+            started with MAISHAC_ALLOW_OUTSIDE_PROJECT=1.
+        analyzers: Optional subset of ["native", "cppcheck", "clang-tidy", "compiler"]
+            ("compiler" runs gcc/clang with warnings, so its findings need that
+            compiler installed). Unknown names are an error that lists the valid
+            ones. Default: every analyzer installed on this machine.
+        include_paths: Header search dirs forwarded to cppcheck/clang-tidy/the
+            compiler as -I. Without these, headers outside `paths` (e.g. a
+            project's config.h) are invisible to those analyzers and they
+            misreport "undefined identifier"/"file not found" false positives
+            (or fail to compile the file at all) instead of finding real defects.
+        exclude: Extra fnmatch patterns of directories/files to skip when a
+            directory is walked (e.g. ["third_party", "gen/*"]). Always skipped:
+            .git, .maishac, build, dist, node_modules, .venv and similar.
+        std: C standard for the compiler/clang-tidy checks (default "c11").
+        compiler_flags: Extra -D/-U/-I/-isystem/-iquote/-std= flags (attached
+            values, e.g. "-DNDEBUG") for the compiling analyzers. Other flags are
+            rejected.
+        compile_commands: Path to a compile_commands.json to take per-file
+            flags from (relative to the project root).
 
     Returns JSON with counts and a memory diff (new/persisting/resolved/
     regressed/suppressed/deviated). Use compliance_list_findings to see details.
@@ -74,11 +182,24 @@ def compliance_scan(paths: list[str], analyzers: list[str] | None = None,
     relay it to the user and must not describe a clean or converged scan as
     "compliant"; the unchecked rules were never examined. Call
     compliance_doctor for the full picture.
+
+    ALSO CHECK `analyzer_errors` (and `analysis_complete`). An analyzer that
+    crashed, timed out, or could not compile a file reports nothing for it, which
+    looks exactly like "no violations". Maisha never marks findings resolved on
+    the strength of such a run, but you must tell the user which analyzer failed
+    and must not present the scan as clean.
     """
-    return _j(_engine().scan(paths, analyzers, include_paths=include_paths))
+    err = _confinement_error(paths=paths, include_paths=include_paths, exclude=exclude,
+                             compiler_flags=compiler_flags,
+                             files=[compile_commands] if compile_commands else None)
+    if err:
+        return _j({"error": err})
+    return _j(_engine().scan(paths, analyzers, include_paths=include_paths,
+                             exclude=exclude, std=std, compiler_flags=compiler_flags,
+                             compile_commands=compile_commands))
 
 
-@mcp.tool()
+@_tool
 def compliance_list_findings(limit: int = 25, severity_floor: str = "info") -> str:
     """List open findings from memory, most severe first (regressions on top).
 
@@ -94,7 +215,7 @@ def compliance_list_findings(limit: int = 25, severity_floor: str = "info") -> s
     return _j({"count": len(rows), "findings": eng._brief_many(rows)})
 
 
-@mcp.tool()
+@_tool
 def compliance_get_finding(fingerprint: str) -> str:
     """Get full detail for one finding: rule guidance, fix hint, equivalent
     rules in other standards, prior fix attempts and relevant project memory.
@@ -112,7 +233,7 @@ def compliance_get_finding(fingerprint: str) -> str:
     return _j(detail)
 
 
-@mcp.tool()
+@_tool
 def compliance_doctor() -> str:
     """Diagnose what this machine can actually detect, and what it cannot.
 
@@ -132,7 +253,7 @@ def compliance_doctor() -> str:
 
 
 # ---------------------------------------------------------------- rule intel
-@mcp.tool()
+@_tool
 def compliance_explain_rule(rule: str) -> str:
     """Explain a coding-standard rule and how to fix violations of it.
 
@@ -150,7 +271,7 @@ def compliance_explain_rule(rule: str) -> str:
     return _j(out)
 
 
-@mcp.tool()
+@_tool
 def compliance_search_rules(query: str, limit: int = 10) -> str:
     """Full-text search the MISRA/BARR-C/CERT rule knowledge base.
 
@@ -161,7 +282,7 @@ def compliance_search_rules(query: str, limit: int = 10) -> str:
     return _j(REGISTRY.search(query, limit))
 
 
-@mcp.tool()
+@_tool
 def compliance_guidance(topic: str, limit: int = 5) -> str:
     """Proactive author-time guidance: BEFORE you write C for a given concern,
     get the compliant idiom to reach for. Returns, per matching pattern, the
@@ -179,7 +300,7 @@ def compliance_guidance(topic: str, limit: int = 5) -> str:
     return _j(_engine().guidance(topic, limit))
 
 
-@mcp.tool()
+@_tool
 def compliance_check_snippet(code: str, filename: str = "draft.c") -> str:
     """Lint a draft C snippet for MISRA/BARR-C/CERT violations IN MEMORY, before
     you write it to a file. Nothing is scanned or stored. Call this while
@@ -200,14 +321,17 @@ def compliance_check_snippet(code: str, filename: str = "draft.c") -> str:
 
 
 # --------------------------------------------------------------- the loop
-@mcp.tool()
+@_tool
 def compliance_begin_session(paths: list[str], max_iterations: int = 10,
                              batch_size: int = 5,
                              severity_floor: str = "minor",
                              verification_policy: str | None = None,
-                             test_command: str | None = None,
                              force: bool = False,
-                             include_paths: list[str] | None = None) -> str:
+                             include_paths: list[str] | None = None,
+                             exclude: list[str] | None = None,
+                             std: str | None = None,
+                             compiler_flags: list[str] | None = None,
+                             compile_commands: str | None = None) -> str:
     """Start an engineered fix session: runs a baseline scan and opens a loop
     with budgets, stall detection and oscillation guards.
 
@@ -218,30 +342,42 @@ def compliance_begin_session(paths: list[str], max_iterations: int = 10,
         severity_floor: Ignore findings below this severity
             (blocker|critical|major|minor|info; default minor).
         verification_policy: How a fix is confirmed resolved:
-            "analyzer_only" (the analyzer stopped flagging it — NOT recommended
-            for compliance; it can't see behavior changes at sentinel/boundary
-            values), "test_gated" (a passing test_command confirms fixes), or
+            "analyzer_only" (refused over MCP unless the operator sets
+            MAISHAC_ALLOW_AGENT_APPROVALS=1; the analyzer stopping is not
+            evidence a fix is right, it can't see behavior changes at
+            sentinel/boundary values), "test_gated" (a passing human-configured test command confirms fixes), or
             "human_gated" (a human must call compliance_approve_finding).
-            Default: test_gated if test_command is given, else human_gated.
-        test_command: Shell command that must exit 0 to confirm fixes at verify
-            time, e.g. "make test". High-severity and semantic-risk findings
-            (casts/comparisons/conversions) still require human approval.
+            Default: test_gated if the HUMAN configured a test command (CLI
+            --test-command, MAISHAC_TEST_COMMAND or .maishac/config.json), else
+            human_gated. An agent cannot set the test command: it runs on the
+            host, so only the person running the project may choose it.
+            High-severity and semantic-risk findings (casts/comparisons/
+            conversions) still require human approval.
         force: Start a new session even if one is already active on this project
             (otherwise begin returns the active session id so you can resume it).
         include_paths: Header search dirs forwarded to cppcheck/clang-tidy as -I
             on every scan/verify in this session. Without these, headers outside
             `paths` are invisible to those analyzers and they misreport
             "undefined identifier"/"file not found" false positives.
+        exclude, std, compiler_flags, compile_commands: Same as compliance_scan;
+            applied on every scan/verify in this session.
 
     Follow with compliance_next_batch.
     """
+    err = _confinement_error(paths=paths, include_paths=include_paths, exclude=exclude,
+                             compiler_flags=compiler_flags,
+                             files=[compile_commands] if compile_commands else None)
+    if err:
+        return _j({"error": err})
     return _j(_engine().begin_session(paths, {
         "max_iterations": max_iterations, "batch_size": batch_size,
         "severity_floor": severity_floor, "verification_policy": verification_policy,
-        "test_command": test_command, "include_paths": include_paths}, force=force))
+        "include_paths": include_paths,
+        "exclude": exclude, "std": std, "compiler_flags": compiler_flags,
+        "compile_commands": compile_commands}, force=force))
 
 
-@mcp.tool()
+@_tool
 def compliance_next_batch(session_id: str) -> str:
     """Get the next prioritized batch of findings to fix (regressions first,
     then by severity, grouped by file). Each finding includes rule guidance,
@@ -254,7 +390,7 @@ def compliance_next_batch(session_id: str) -> str:
     return _j(_engine().next_batch(session_id))
 
 
-@mcp.tool()
+@_tool
 def compliance_record_attempt(session_id: str, fingerprint: str,
                               strategy: str, notes: str = "") -> str:
     """Record the fix strategy you are about to apply to a finding. Call this
@@ -270,11 +406,17 @@ def compliance_record_attempt(session_id: str, fingerprint: str,
     return _j(_engine().record_attempt(session_id, fingerprint, strategy, notes))
 
 
-@mcp.tool()
+@_tool
 def compliance_verify(session_id: str) -> str:
     """Re-scan after your edits, grade every pending fix attempt, detect
     regressions, and decide the loop state: active | converged |
-    budget_exhausted | stalled. Call after each editing round.
+    awaiting_verification | analysis_incomplete | budget_exhausted | stalled.
+    Call after each editing round.
+
+    `analysis_incomplete` means an analyzer failed or could not analyze some
+    files (see `analyzer_errors`): a clean result is not trusted, nothing is
+    resolved on its account, and the session cannot converge. Tell the user
+    what failed, fix the cause (usually missing include paths) and verify again.
 
     Args:
         session_id: Active session id.
@@ -282,7 +424,7 @@ def compliance_verify(session_id: str) -> str:
     return _j(_engine().verify(session_id))
 
 
-@mcp.tool()
+@_tool
 def compliance_session_status(session_id: str) -> str:
     """Get a session's state, iteration count and per-iteration history.
 
@@ -292,106 +434,155 @@ def compliance_session_status(session_id: str) -> str:
     return _j(_engine().session_status(session_id))
 
 
-@mcp.tool()
+@_tool
+def compliance_abort_session(session_id: str, reason: str = "") -> str:
+    """End a session on purpose (for example when the user changes plans). Its
+    undecided fix attempts are marked abandoned and the end is audit-logged. A
+    session that already ended cannot be aborted, and an ended session accepts no
+    further next_batch, verify or record_attempt calls.
+
+    Args:
+        session_id: Session id from compliance_begin_session.
+        reason: Why it is being aborted (kept in the audit log).
+    """
+    return _j(_engine().abort_session(session_id, reason, by="agent"))
+
+
+@_tool
 def compliance_import_sarif(path: str) -> str:
     """Import findings from an external SARIF 2.1.0 file into project memory, so
     a qualified/certified engine's output (Helix QAC, Polyspace, Parasoft,
     IAR C-STAT, or cppcheck's own --sarif) gets the same loop, memory, gate and
     deviation treatment as a native scan. Recognized MISRA/CERT ruleIds map onto
     the knowledge base; others are kept as `sarif:<ruleId>`. Imported findings
-    are NOT cleared by native rescans.
+    are NOT cleared by native rescans. Suppressions inside the file are NOT
+    applied when the import comes from an agent (they would let a crafted file
+    hide findings); a person can carry them over with `maishac import`.
 
     Args:
         path: Path to the SARIF file (relative to the project root or absolute).
     """
-    return _j(_engine().import_sarif(path))
+    eng = _engine()
+    if isinstance(path, str) and not outside_project_allowed():
+        resolved = eng._resolve_input_path(path).resolve()
+        if resolved != eng.root and eng.root not in resolved.parents:
+            return _j({"error": _confine_error("SARIF path", path, eng.root)})
+    return _j(eng.import_sarif(path, carry_suppressions=agent_approvals_allowed()))
 
 
-@mcp.tool()
-def compliance_approve_finding(fingerprint: str, approved_by: str) -> str:
-    """Human sign-off that a fix is genuinely correct, moving a finding from
+@_tool
+def compliance_approve_finding(fingerprint: str, approved_by: str = "") -> str:
+    """Propose that a fix is genuinely correct, moving a finding from
     pending_verification to resolved. Required for high-severity and
     semantic-risk findings (casts, comparisons, sign conversions, control-flow
     changes) whose fix a passing test suite alone cannot vouch for — the
     analyzer only checks the pattern is gone, never that the edit preserved the
     intended behavior at sentinel/boundary values.
 
+    HUMAN SIGN-OFF REQUIRED: by default this does NOT take effect. It records a
+    proposal (status pending_human) that a person finalizes with
+    `maishac proposals accept <id> --by <name>`. Report the proposal id to the
+    user and carry on with other work; do not retry or look for a way around it.
+    (The operator can set MAISHAC_ALLOW_AGENT_APPROVALS=1 to apply it directly;
+    that is unsafe and is flagged in reports.)
+
     Args:
         fingerprint: The pending finding's fingerprint (from compliance_verify).
-        approved_by: Who is signing off — recorded in the audit trail.
+        approved_by: Who you expect to sign off (informational; the human who
+            accepts the proposal is the one recorded).
     """
-    return _j(_engine().approve(fingerprint, approved_by))
+    return _signoff("approve", _engine().approve, fingerprint=fingerprint,
+                    approved_by=approved_by)
 
 
 # ---------------------------------------------------- deviations/suppression
-@mcp.tool()
+@_tool
 def compliance_add_deviation(rule: str, scope: str, justification: str,
                              approver: str = "", expires_days: float = 0) -> str:
-    """Record a formal, justified deviation from a rule (MISRA-style deviation
-    record). Deviated findings stop counting against compliance but stay in the
-    audit trail. Use sparingly and only with a real engineering justification.
+    """Propose a formal, justified deviation from a rule (MISRA-style deviation
+    record). Once a human accepts it, deviated findings stop counting against
+    compliance but stay in the audit trail. Use sparingly and only with a real
+    engineering justification. MISRA Mandatory guidelines (including ones a GRP
+    entry made Mandatory) can never be deviated.
+
+    HUMAN SIGN-OFF REQUIRED: by default this does NOT take effect. It records a
+    proposal (status pending_human) that a person finalizes with
+    `maishac proposals accept <id> --by <name>`. Report the proposal id to the
+    user and carry on with other work; do not retry or look for a way around it.
+    (The operator can set MAISHAC_ALLOW_AGENT_APPROVALS=1 to apply it directly;
+    that is unsafe and is flagged in reports.)
 
     Args:
-        rule: Rule reference, e.g. "MISRA 21.6".
+        rule: Exact rule reference, e.g. "MISRA 21.6", "MISRA Dir 4.6",
+            "CERT STR31-C". Partial references ("misra", "21") are rejected.
         scope: Glob over project-relative file paths, e.g. "src/debug/*" or "*".
-        justification: Engineering rationale (required, be specific).
-        approver: Person/role approving the deviation.
-        expires_days: Auto-expire after N days (0 = never).
+        justification: Engineering rationale (required, at least 15 characters).
+        approver: Person/role you expect to approve (informational).
+        expires_days: Auto-expire after N days (0 = never; negative is rejected).
     """
-    meta = REGISTRY.resolve(rule)
-    if not meta:
-        return _j({"error": f"Unknown rule '{rule}'."})
-    if len(justification.strip()) < 15:
-        return _j({"error": "Justification too short; write a real engineering rationale."})
-    try:
-        did = _engine().mem.add_deviation(meta["id"], scope, justification, approver,
-                                          expires_days or None)
-    except MandatoryRuleError as e:
-        return _j({"error": str(e)})
-    return _j({"deviation_id": did, "rule_id": meta["id"], "scope": scope,
-               "note": "Re-run compliance_scan or compliance_verify to apply."})
+    return _signoff("deviate", _engine().deviate, rule=rule, scope=scope,
+                    justification=justification, approver=approver,
+                    expires_days=expires_days or None)
 
 
-@mcp.tool()
+@_tool
 def compliance_recategorize(rule: str, to_category: str, rationale: str,
                             approver: str = "") -> str:
-    """Record a MISRA Guideline Re-categorization Plan (GRP) entry — an agreed,
+    """Propose a MISRA Guideline Re-categorization Plan (GRP) entry — an agreed,
     project-wide change to a guideline's category. Legality is enforced per MISRA
     Compliance:2020: Advisory → Mandatory/Required/Disapplied; Required →
-    Mandatory only; a Mandatory guideline may not be re-categorized at all. The
-    new category flows into the compliance summary (a Disapplied guideline is
-    removed from the compliance argument; a Mandatory one can no longer be
-    deviated). Show it with compliance_report(format="grp").
+    Mandatory only; a Mandatory guideline may not be re-categorized at all. Once
+    accepted, the new category flows into the compliance summary (a Disapplied
+    guideline is removed from the compliance argument; a Mandatory one can no
+    longer be deviated or suppressed). Show it with compliance_report(format="grp").
+
+    HUMAN SIGN-OFF REQUIRED: by default this does NOT take effect. It records a
+    proposal (status pending_human) that a person finalizes with
+    `maishac proposals accept <id> --by <name>`. Report the proposal id to the
+    user and carry on with other work; do not retry or look for a way around it.
+    (The operator can set MAISHAC_ALLOW_AGENT_APPROVALS=1 to apply it directly;
+    that is unsafe and is flagged in reports.)
 
     Args:
         rule: Rule reference, e.g. "MISRA 15.5".
         to_category: mandatory | required | advisory | disapplied.
         rationale: Why (agreed between acquirer and supplier). Required.
-        approver: Person/role approving the re-categorization.
+        approver: Person/role you expect to approve (informational).
     """
-    return _j(_engine().recategorize(rule, to_category, rationale, approver))
+    return _signoff("recategorize", _engine().recategorize, rule=rule,
+                    to_category=to_category, rationale=rationale, approver=approver)
 
 
-@mcp.tool()
+@_tool
 def compliance_suppress_finding(fingerprint: str, reason: str) -> str:
-    """Mark one specific finding as a false positive. Requires a reason;
-    suppressions are permanent for that fingerprint and audited.
+    """Propose marking one specific finding as a false positive. Requires a
+    reason (at least 10 characters). Findings of MISRA Mandatory guidelines can
+    never be suppressed. Once a human accepts it the suppression is audited and
+    can be removed with `maishac unsuppress`.
+
+    HUMAN SIGN-OFF REQUIRED: by default this does NOT take effect. It records a
+    proposal (status pending_human) that a person finalizes with
+    `maishac proposals accept <id> --by <name>`. Report the proposal id to the
+    user and carry on with other work; do not retry or look for a way around it.
+    (The operator can set MAISHAC_ALLOW_AGENT_APPROVALS=1 to apply it directly;
+    that is unsafe and is flagged in reports.)
 
     Args:
         fingerprint: The finding fingerprint.
         reason: Why this is a false positive.
     """
-    eng = _engine()
-    if not eng.mem.get_finding(fingerprint):
-        return _j({"error": f"No finding with fingerprint '{fingerprint}'."})
-    if len(reason.strip()) < 10:
-        return _j({"error": "Reason too short; explain why the analyzer is wrong here."})
-    eng.mem.suppress(fingerprint, reason)
-    return _j({"suppressed": fingerprint})
+    return _signoff("suppress", _engine().suppress, fingerprint=fingerprint, reason=reason)
+
+
+@_tool
+def compliance_list_proposals() -> str:
+    """List sign-off proposals still waiting for a human (pending_human). Use it
+    to remind the user what needs their decision; you cannot accept them."""
+    return _j(_engine().list_proposals())
 
 
 # -------------------------------------------------------------------- memory
-@mcp.tool()
+@_tool
 def memory_note(content: str, topic: str = "", tags: str = "") -> str:
     """Persist project knowledge for future sessions: conventions, approved
     allocator/logging shims, architectural decisions, gotchas.
@@ -406,7 +597,7 @@ def memory_note(content: str, topic: str = "", tags: str = "") -> str:
     return _j({"note_id": nid})
 
 
-@mcp.tool()
+@_tool
 def memory_search(query: str, limit: int = 10) -> str:
     """Search persisted project memory notes.
 
@@ -417,7 +608,7 @@ def memory_search(query: str, limit: int = 10) -> str:
     return _j(_engine().mem.search_notes(query, limit))
 
 
-@mcp.tool()
+@_tool
 def memory_stats() -> str:
     """Snapshot of everything the harness remembers about this project:
     finding lifecycle counts, deviations, suppressions, notes, fix attempts."""
@@ -425,7 +616,7 @@ def memory_stats() -> str:
 
 
 # ------------------------------------------------------------------- reports
-@mcp.tool()
+@_tool
 def compliance_report(format: str = "markdown") -> str:
     """Generate an auditable compliance report from memory.
 
@@ -453,7 +644,11 @@ def compliance_report(format: str = "markdown") -> str:
 
 
 def main() -> None:
-    mcp.run(transport="stdio")
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        if _ENGINE is not None:
+            _ENGINE.close()
 
 
 if __name__ == "__main__":

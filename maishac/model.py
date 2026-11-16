@@ -14,7 +14,6 @@ import re
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
-from typing import Optional
 
 
 class Severity(str, Enum):
@@ -48,10 +47,18 @@ def _normalize_line(line: str) -> str:
 
 
 def compute_fingerprint(rule_id: str, rel_path: str, line_content: str,
-                        context_symbol: str = "") -> str:
+                        context_symbol: str = "", occurrence: int = 0) -> str:
     """Stable identity of a defect: rule + file + normalized offending line +
-    enclosing symbol. Deliberately excludes the line *number*."""
-    payload = "\x1f".join([rule_id, rel_path, _normalize_line(line_content), context_symbol])
+    enclosing symbol. Deliberately excludes the line *number*.
+
+    ``occurrence`` tells apart the nth identical violating line in the same
+    function. Occurrence 0 hashes exactly as it did before the argument
+    existed, so every fingerprint already on record stays valid.
+    """
+    fields = [rule_id, rel_path, _normalize_line(line_content), context_symbol]
+    if occurrence:
+        fields.append(str(int(occurrence)))
+    payload = "\x1f".join(fields)
     return hashlib.sha1(payload.encode("utf-8", "replace")).hexdigest()[:16]
 
 
@@ -74,6 +81,8 @@ class Finding:
     suppression: dict = field(default_factory=dict)  # {justification, kind} if an imported SARIF result was already suppressed/baselined
 
     def __post_init__(self) -> None:
+        # Identity must not depend on the OS: always forward slashes.
+        self.file = self.file.replace("\\", "/")
         if not self.fingerprint:
             self.fingerprint = compute_fingerprint(
                 self.rule_id, self.file, self.line_content, self.context_symbol
@@ -86,6 +95,79 @@ class Finding:
     def from_dict(d: dict) -> "Finding":
         known = {f for f in Finding.__dataclass_fields__}  # type: ignore[attr-defined]
         return Finding(**{k: v for k, v in d.items() if k in known})
+
+
+def _base_fingerprint(f: "Finding") -> str:
+    return compute_fingerprint(f.rule_id, f.file, f.line_content, f.context_symbol)
+
+
+def occurrence_alignment(runs: list[list["Finding"]]) -> dict[str, list[int]]:
+    """Line lists that let several analyzers number identical violations alike.
+
+    ``assign_occurrences`` numbers repeats within one analyzer's run. If tool A
+    reports both of two identical lines and tool B only the second, B's lone
+    finding would be occurrence 0 and merge into A's finding for the FIRST line.
+    For each group of identical violations this returns the sorted union of the
+    lines all analyzers reported, so occurrence = position in that union. It is
+    only used when the analyzers agree on how many distinct violations there are
+    (the union is as long as the largest single run's list); if they disagree on
+    where one violation is (off-by-a-line reports) alignment would invent extra
+    occurrences, so that group keeps per-analyzer numbering.
+    """
+    union: dict[str, set[int]] = {}
+    biggest: dict[str, int] = {}
+    for run in runs:
+        per: dict[str, set[int]] = {}
+        for f in run:
+            if f.fingerprint == _base_fingerprint(f):
+                per.setdefault(f.fingerprint, set()).add(f.line)
+        for base, lines in per.items():
+            union.setdefault(base, set()).update(lines)
+            biggest[base] = max(biggest.get(base, 0), len(lines))
+    return {base: sorted(lines) for base, lines in union.items()
+            if len(lines) == biggest[base]}
+
+
+def assign_occurrences(findings: list["Finding"],
+                       aligned: dict[str, list[int]] | None = None) -> list["Finding"]:
+    """Give identical violations their own identity.
+
+    Two findings of the same rule on identical (whitespace-normalized) lines in
+    the same function of one file hash to the same fingerprint, so fixing one
+    would look like fixing both. Within one analyzer run, the nth such finding
+    (in line order) gets occurrence n folded into its fingerprint. Occurrence 0
+    keeps the legacy fingerprint. Repeats on the very same line are one
+    finding, as before. Only fingerprints Maisha computed itself are touched;
+    ones supplied by an external tool are kept verbatim.
+
+    ``aligned`` (from :func:`occurrence_alignment`) numbers a finding by the
+    position of its line in the lines every analyzer reported, instead of by
+    the order within this run alone.
+
+    Returns the findings with exact repeats removed, in their original order.
+    """
+    groups: dict[str, list[Finding]] = {}
+    for f in findings:
+        base = compute_fingerprint(f.rule_id, f.file, f.line_content, f.context_symbol)
+        if f.fingerprint == base:
+            groups.setdefault(base, []).append(f)
+    drop: set[int] = set()
+    for base, members in groups.items():
+        order = sorted(members, key=lambda f: (f.line, f.column))
+        places: list[int] = []
+        for f in order:
+            place = f.line
+            if place in places:
+                drop.add(id(f))
+                continue
+            places.append(place)
+            n = len(places) - 1
+            if aligned and place in aligned.get(base, ()):
+                n = aligned[base].index(place)
+            if n:
+                f.fingerprint = compute_fingerprint(f.rule_id, f.file, f.line_content,
+                                                    f.context_symbol, n)
+    return [f for f in findings if id(f) not in drop]
 
 
 _CTRL_LEAD_RE = re.compile(r"^\s*(if|for|while|switch|else|do)\b")
@@ -147,10 +229,12 @@ def enclosing_function(lines: list[str], idx: int) -> str:
 
 
 def relpath(path: str | Path, root: str | Path) -> str:
+    """Project-relative path with forward slashes on every OS, so a fingerprint
+    computed on Windows equals the one computed on Linux."""
     try:
-        return str(Path(path).resolve().relative_to(Path(root).resolve()))
+        return Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
     except ValueError:
-        return str(path)
+        return Path(path).as_posix()
 
 
 def jdump(obj) -> str:

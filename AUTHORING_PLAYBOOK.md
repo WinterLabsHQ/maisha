@@ -60,6 +60,9 @@ committed file at a natural checkpoint.
   magic literals, unchecked returns, etc. It does **not** catch whole-program
   rules (data flow, value ranges, aliasing) that need a build model. A `clean`
   snippet is *not* a compliance guarantee.
+- **"Clean" only covers what was checked.** Rules that no active analyzer
+  implements are reported as `Not checked` in the compliance reports, never as
+  compliant. Treat a clean snippet or scan the same way.
 - **Certification still needs a qualified engine.** For evidence an assessor
   accepts, run a qualified engine (Polyspace / Helix QAC / Astrée) on the
   committed code and `compliance_import_sarif` its results. Author-time checking

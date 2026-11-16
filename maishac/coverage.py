@@ -21,16 +21,12 @@ clang-tidy is not a promise it fires on a given construct.
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
-
 from .rules import REGISTRY
 from .analyzers.cppcheck import CPPCHECK_TO_CERT, CPPCHECK_MISRA_IMPLEMENTED
 from .analyzers.clang_tidy import CLANG_TIDY_CERT_RULES
 from .analyzers.compiler import WFLAG_TO_RULE
+from .analyzers.native import NATIVE_RULES
 
-_NATIVE_SRC = Path(__file__).resolve().parent / "analyzers" / "native.py"
-_RULE_QUERY = re.compile(r'"((?:MISRA|CERT|BARR)[^"]*)"')
 
 # Rules where the native check implements a real but *partial* subset of what the
 # guideline requires. MISRA Compliance:2020 requires a Guideline Enforcement Plan
@@ -49,14 +45,15 @@ NATIVE_PARTIAL = {
 
 
 def native_ids() -> set[str]:
-    """Canonical ids the native analyzer can emit, read from its own source.
+    """Canonical ids the native analyzer can emit.
 
-    Deliberately derived from the code rather than hand-listed: adding a check
-    to native.py updates the coverage table and the tier split automatically,
-    so a new detector can't ship while the docs still say 'not detected'.
+    Read from the analyzer's explicit `NATIVE_RULES` registry. The analyzer
+    refuses to emit a rule that is not in it, and a test compares the registry
+    with the checks written in native.py, so adding a detector updates the
+    coverage table and the tier split without anyone hand-editing a second list.
     """
     ids = set()
-    for q in _RULE_QUERY.findall(_NATIVE_SRC.read_text("utf-8")):
+    for q in NATIVE_RULES:
         meta = REGISTRY.resolve(q)
         if meta:
             ids.add(meta["id"])
@@ -169,6 +166,23 @@ def toolchain_status(selected: list[str] | None = None) -> dict:
     }
 
 
+def toolchain_snapshot(status: dict) -> dict:
+    """`toolchain_status()` plus the version string of every installed analyzer,
+    for the scan log. Kept out of toolchain_status itself because that runs on
+    every report and must not spawn subprocesses; this runs once per scan."""
+    from .analyzers import ALL_ANALYZERS
+
+    versions = {}
+    for cls in ALL_ANALYZERS:
+        an = cls()
+        if an.name in status["installed"]:
+            try:
+                versions[an.name] = an.version()
+            except Exception as e:  # a broken --version must not fail a scan
+                versions[an.name] = f"unknown ({type(e).__name__})"
+    return {**status, "versions": versions}
+
+
 def toolchain_warning(status: dict) -> str:
     """One-paragraph, human-readable version of a degraded toolchain, or ''.
 
@@ -187,6 +201,23 @@ def toolchain_warning(status: dict) -> str:
     L.append("A clean result here does NOT mean the code is compliant with the "
              "rules above - they were never checked. Run `maishac doctor` for "
              "detail, or install the missing analyzers.")
+    return "\n".join(L)
+
+
+def analyzer_failure_warning(errors: list[dict]) -> str:
+    """Human-readable account of analyzers that failed or only partly worked
+    in a scan, or ''. Distinct from toolchain_warning: that one is about tools
+    that are not installed, this one about tools that ran and did not deliver."""
+    if not errors:
+        return ""
+    L = ["Analysis incomplete: findings from the analyzers below are NOT reliable "
+         "for this run, and nothing they previously reported was marked resolved."]
+    for e in errors:
+        n = e.get("files_not_analyzed", 0)
+        what = "failed" if e.get("status") == "failed" else "partly failed"
+        L.append(f"  - {e['analyzer']} {what} ({n} file(s) not analyzed): {e.get('error', '')}")
+    L.append("A clean result here does NOT mean the code is compliant. Fix the "
+             "analyzer problem (missing headers need -I include paths) and rescan.")
     return "\n".join(L)
 
 

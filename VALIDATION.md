@@ -6,6 +6,8 @@
 **Version under test:** 0.3.1 · **Baseline commit:** `62b4399` (+ the fixes recorded in §6 of this cycle).
 **Date of run:** 2026-07-17.
 
+> **Historical note:** this evidence pack records a run against 0.3.1 and has not been re-run for later releases. The version above is the version tested, not the current release (see `maishac --version`).
+
 ---
 
 ## 0. What this document is — and is NOT

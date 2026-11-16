@@ -43,11 +43,18 @@ Rules of engagement:
   the attempt with strategy `"needs-behavioral-decision"` and move on.
 - Regressions in the batch (marked `REGRESSED`) take priority over everything.
 - If the finding is a false positive, call `compliance_suppress_finding` with a
-  concrete reason — do not silently skip it.
+  concrete reason — do not silently skip it. This only records a **proposal**:
+  a human has to accept it (`maishac proposals accept <id> --by <name>`), so the
+  finding stays open until then. Never try to work around that.
 - If the code is genuinely correct but non-compliant for a documented hardware
   or platform reason, call `compliance_add_deviation` with a real justification
-  (≥ 15 chars enforced), a tight `scope` glob, and an approver. Deviations are
-  audit records, not escape hatches.
+  (≥ 15 chars enforced) and a tight `scope` glob. Deviations are audit records,
+  not escape hatches, and like suppressions they are **proposals** a human must
+  accept. MISRA Mandatory guidelines can never be suppressed or deviated: fix them.
+- `compliance_approve_finding` and `compliance_recategorize` follow the same
+  rule. Tell the user which proposal ids are waiting (`compliance_list_proposals`)
+  and keep working on other findings. You cannot set the test command either;
+  that is configured by the human running the project.
 
 ### 4. Record
 
@@ -73,6 +80,20 @@ Then check `state`:
 | `converged` | no open findings above the floor | write the report, stop |
 | `stalled` | two verifies with no progress | stop; summarize blockers for the human |
 | `budget_exhausted` | `max_iterations` reached | stop; summarize remaining work |
+| `needs_human` | every remaining finding is frozen (regressed twice) | stop; list the frozen findings for the human |
+| `analysis_incomplete` | an analyzer failed or timed out during the re-scan, so "nothing left" cannot be concluded | do **not** report success. Show `analyzer_errors` / `coverage_warning` to the human; call `verify` again once the toolchain is fixed |
+| `aborted` | the session was ended on purpose (`compliance_abort_session`) | stop; ended sessions refuse `next_batch`/`verify`/`record_attempt` |
+
+A clean rescan only counts when `analysis_complete` is true. If `analyzer_errors`
+is non-empty, a "resolved" finding may simply be one an analyzer never got to
+re-check. Never present such a result as a fix. If the user asks you to stop
+midway, call `compliance_abort_session(session_id, reason)` instead of leaving
+the session active.
+
+`verify` only grades findings inside the session's severity floor and paths;
+others come back as `open_out_of_scope`, and findings imported from a SARIF file
+as `open_imported` (a person confirms those with `approve`). Neither blocks
+`converged`, but mention them in your summary.
 
 Findings frozen as `needs_human` (regressed twice) must be listed in your final
 summary — never keep retrying them.
@@ -80,8 +101,16 @@ summary — never keep retrying them.
 ### 6. Finish
 
 On any terminal state, call `compliance_report(format="markdown")` and present
-it, along with: findings you suppressed (and why), deviations you added, and
-anything frozen for human review.
+it, along with: suppressions and deviations you proposed (and why, with their
+proposal ids), and anything frozen for human review.
+
+## What reports do and do not claim
+
+`compliance_report` and `misra_compliance_summary` mark any guideline that no
+analyzer successfully checked in the last scan as **`Not checked`**, and the
+verdict reads `NO VIOLATIONS FOUND IN CHECKED GUIDELINES (N unchecked)`, or
+`NOT ASSESSED` when no scan has run. Quote that wording as written. Do not
+rephrase it as "compliant" or "MISRA clean" in your summary to the user.
 
 ## Memory etiquette
 

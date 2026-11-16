@@ -42,13 +42,24 @@ dependencies:
 pipx install maishac          # recommended if you have pipx
 ```
 
+**Using an editor or agent (MCP)?** The MCP server is an optional extra, so
+install it with:
+
+```bash
+pipx install 'maishac[mcp]'   # or: pip install 'maishac[mcp]'
+```
+
+The CLI (`scan`, `gate`, `report`, sessions) works without it; `maishac serve`
+prints this install hint if the extra is missing. The extra is limited to
+`mcp>=1.2.0,<2`: mcp 2.x removed the module Maisha's server imports.
+
 <details>
 <summary>From source (for contributing, or to get unreleased changes)</summary>
 
 ```bash
 git clone https://github.com/WinterLabsHQ/maisha.git
 cd maisha
-pip install -e ".[dev]"
+pip install -e ".[dev,mcp]"
 python -m pytest tests/ -q
 ```
 </details>
@@ -66,6 +77,17 @@ docker run --rm -v "$PWD:/work" ghcr.io/winterlabshq/maisha doctor
 
 `-v "$PWD:/work"` mounts your project; the container works in `/work`. Nothing
 is uploaded anywhere — the container runs entirely on your machine.
+
+The image also contains gcc (for the `compiler` analyzer) and includes the `[mcp]`
+extra. It runs as an unprivileged user (uid/gid 1000), and Maisha writes its
+memory to `<project>/.maishac/`, so the mounted directory must be writable by that
+user. If your host uid is not 1000, run with your own ids:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/winterlabshq/maisha scan src/
+```
+
+A read-only mount (`:ro`) cannot record findings; scan a writable copy instead.
 </details>
 
 At this point Maisha works, but only with its built-in checks. Keep going.
@@ -144,10 +166,10 @@ maishac doctor
 ```
 
 ```
-maishac 0.3.2 at /home/you/firmware
+maishac 0.4.0 at /home/you/firmware
 
 Analyzers
-  [ ok ] analyzer: native: maishac 0.3.2
+  [ ok ] analyzer: native: maishac 0.4.0
   [ ok ] analyzer: cppcheck: Cppcheck 2.17.1
   [ ok ] cppcheck MISRA addon: MISRA addon responds
   [warn] analyzer: clang-tidy: not installed (needs clang-tidy on PATH)
@@ -367,13 +389,25 @@ jobs:
       # Fails the build on a broken install; a narrow one only warns.
       - run: maishac doctor
 
-      - run: maishac scan src/ --include include/
+      # Gate: exit 1 on open findings, 2 if the analysis was degraded
+      # (see "CI exit codes" below). Drop --fail-on to only record results.
+      - run: maishac scan src/ --include include/ --fail-on any
       - run: maishac report --format sarif > compliance.sarif
+        if: always()
 
       # Surfaces findings in the Security tab and on the PR diff
       - uses: github/codeql-action/upload-sarif@v3
         with: { sarif_file: compliance.sarif }
 ```
+
+**CI exit codes** (`maishac scan --fail-on SEVERITY`, or `maishac gate`, which is
+`scan --fail-on any`): `1` when an open finding is at or above `SEVERITY`
+(`blocker|critical|major|minor|info`, `any` = every finding, `none` = never fail on
+findings); `2` when no finding fails the gate but the analysis was degraded (an
+analyzer crashed or timed out, or a recommended analyzer is not installed), because a
+clean result then cannot be trusted; `0` otherwise. Findings win over degradation.
+Pass `--allow-degraded` to accept a narrow toolchain. Without `--fail-on`, `scan`
+always exits 0.
 
 Because SARIF is standard, the same file works with GitLab, Azure DevOps,
 SonarQube and most code-quality dashboards.

@@ -85,8 +85,12 @@ def test_memory_lifecycle_and_loop(tmp_path):
         "int32_t entry(void)\n{\n    return add(1, 2);\n}\n")
     v = eng.verify(sid)
     assert v["open_now"] == 0
-    assert v["state"] == "converged"
-    assert v["diff"]["resolved"] > 5
+    # even under analyzer_only, high-severity / semantic-risk findings wait for a person
+    assert v["state"] == "awaiting_verification"
+    assert v["diff"]["resolved"] + v["diff"]["pending"] > 5 and v["diff"]["pending"] > 0
+    for row in eng.mem.pending_findings():
+        assert eng.mem.approve_finding(row["fingerprint"], "lead")["ok"]
+    assert eng.verify(sid)["state"] == "converged"
 
     # regression: put one violation back -> status regressed, prioritized first
     bad.write_text(bad.read_text() + "\nvoid oops(void)\n{\n    goto end;\nend:\n    return;\n}\n")

@@ -3,7 +3,7 @@
 # Maisha
 
 [![CI](https://github.com/WinterLabsHQ/maisha/actions/workflows/ci.yml/badge.svg)](https://github.com/WinterLabsHQ/maisha/actions/workflows/ci.yml)
-&nbsp;[![Release](https://img.shields.io/badge/release-v0.3.2-blue)](https://github.com/WinterLabsHQ/maisha/releases/tag/v0.3.2)
+&nbsp;[![Release](https://img.shields.io/github/v/release/WinterLabsHQ/maisha?label=release)](https://github.com/WinterLabsHQ/maisha/releases/latest)
 &nbsp;![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 &nbsp;![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
@@ -105,7 +105,8 @@ authoritative wording you still need the official MISRA / BARR / SEI CERT docume
   analysis tool *itself* to be qualified or proven-in-use; Maisha does not
   meet that bar and does not claim to.
 - **Not complete rule coverage.** 214 curated rules across three standards is a
-  fraction of MISRA C:2012 (180+ rules/directives with amendments) or CERT C.
+  fraction of MISRA C:2012 (roughly 175 rules/directives with amendments; the
+  figure is approximate and depends on the amendments adopted) or CERT C.
   Of those, 107 are *enforced* (some analyzer detects them) and 107 are
   *reference* entries carried for cross-standard equivalence, deviation records
   and SARIF import — they are not something Maisha finds for you.
@@ -120,6 +121,14 @@ authoritative wording you still need the official MISRA / BARR / SEI CERT docume
   ground-truthed fixtures, a full fix-loop simulation, SARIF import, CLI
   end-to-end and edge-case tests — is in
   [BENCHMARK-SUITE-REPORT.md](BENCHMARK-SUITE-REPORT.md).
+- **Reports say what was not checked.** A guideline no analyzer examined in the
+  last recorded scan is reported as **`Not checked`**, never as compliant. The
+  verdict is `NOT ASSESSED` before any scan and otherwise reads `NO VIOLATIONS
+  FOUND IN CHECKED GUIDELINES (N unchecked)`; plain `COMPLIANT` is only reachable
+  when nothing is unchecked, which in practice means never. An analyzer that
+  crashes, times out or is not installed is a failed *analysis*, not a clean
+  one: its findings are not closed, and the scan reports `analyzer_errors` and
+  a `coverage_warning`. See [Reading the reports](#reading-the-reports).
 - **Not a substitute for human review.** By default a fix is never marked
   `resolved` on a clean rescan alone — a passing test run or an explicit human
   approval is required, and semantic-risk / high-severity findings *always*
@@ -169,6 +178,16 @@ pip install maishac
 This installs the `maishac` CLI and the `maishac` Python package. Verify with
 `maishac --help`.
 
+The MCP server is an **optional extra** (scan, gate, reports and sessions need no
+third-party packages). To run `maishac serve`, install it with:
+
+```bash
+pipx install 'maishac[mcp]'      # or: pip install 'maishac[mcp]'
+```
+
+The extra pins `mcp>=1.2.0,<2` (mcp 2.x removed the `FastMCP` module Maisha uses).
+Without it, `maishac serve` exits with that install hint.
+
 **Or run it as a container** (batteries included — cppcheck's MISRA addon and
 clang-tidy are baked in, so no host setup):
 
@@ -182,7 +201,7 @@ To hack on Maisha itself:
 ```bash
 git clone https://github.com/WinterLabsHQ/maisha.git
 cd maisha
-pip install -e ".[dev]"   # editable install with pytest
+pip install -e ".[dev,mcp]"   # editable install with pytest + the MCP server
 ```
 
 Optional but strongly recommended external analyzers — native works with
@@ -230,7 +249,13 @@ maishac session status abc123
 maishac deviate "MISRA 19.2" --scope "drivers/**" \
     --justification "Union required for hardware register overlay mapping" \
     --approver lead@example.com --expires 2027-01-01
-maishac suppress <fingerprint> --reason "false positive: macro expansion"
+maishac suppress <fingerprint> --reason "false positive: macro expansion" --approver lead@example.com
+maishac unsuppress <fingerprint> --by lead@example.com          # revocations are audited too
+maishac revoke-deviation <deviation-id> --by lead@example.com
+maishac uncategorize "MISRA 15.1" --by lead@example.com
+maishac proposals list                                          # sign-offs an MCP agent asked for
+maishac proposals accept <id> --by lead@example.com             # ...and the human decision
+maishac audit                                                   # append-only history of every sign-off
 maishac note "This codebase uses FreeRTOS; heap_4 allocator is approved" --tags misra-21.3
 maishac recategorize "MISRA 15.1" --to disapplied \
     --rationale "No goto in this codebase; disapplied by acquirer/supplier agreement" \
@@ -282,11 +307,12 @@ The recommended agent protocol is documented in
 | `compliance_next_batch` | Next prioritized batch, regressions first, with per-finding briefings |
 | `compliance_record_attempt` | Log the strategy used on a finding (auto-graded on verify) |
 | `compliance_verify` | Rescan, diff, grade attempts, run the test gate, advance state machine |
-| `compliance_approve_finding` | Human sign-off moving a `pending_verification` finding to `resolved` (required for semantic-risk / high-severity fixes) |
+| `compliance_approve_finding` | **Proposes** a human sign-off moving a `pending_verification` finding to `resolved` (required for semantic-risk / high-severity fixes). Takes effect only when a person runs `maishac proposals accept` (see below) |
 | `compliance_session_status` | Progress, iteration budget, state (`active`/`awaiting_verification`/`converged`/`stalled`/`budget_exhausted`) |
-| `compliance_add_deviation` | MISRA-style deviation record (justification ≥ 15 chars enforced) |
-| `compliance_recategorize` | MISRA GRP re-categorization (legality enforced: no Mandatory re-cat; Required→Advisory/Disapplied forbidden) |
-| `compliance_suppress_finding` | Mark a fingerprint as false positive (reason required) |
+| `compliance_add_deviation` | **Proposes** a MISRA-style deviation record (justification ≥ 15 chars enforced; never for Mandatory guidelines) |
+| `compliance_recategorize` | **Proposes** a MISRA GRP re-categorization (legality enforced: no Mandatory re-cat; Required→Advisory/Disapplied forbidden) |
+| `compliance_suppress_finding` | **Proposes** marking a fingerprint as false positive (reason ≥ 10 chars; never for Mandatory guidelines) |
+| `compliance_list_proposals` | Sign-off proposals still waiting for a human |
 | `memory_note` / `memory_search` / `memory_stats` | Project convention memory |
 | `compliance_import_sarif` | Ingest an external engine's SARIF (qualified engine or cppcheck `--output-format=sarif`) into the same loop/memory/gate; **honors `result.suppressions`** so a team's existing triage/baseline carries over instead of resurfacing as fresh violations |
 | `compliance_report` | Markdown, JSON, SARIF 2.1.0, or the MISRA Compliance:2020 evidence set: `misra-compliance` (GCS), `gep` (enforcement plan), `grp` (re-categorization plan) |
@@ -321,6 +347,84 @@ Design principles:
 4. **Compliance is a process, not a scan.** Deviations and suppressions are
    first-class, auditable records — exactly as MISRA compliance expects.
 
+## CI gate and exit codes
+
+`maishac scan` exits 0 by default, whatever it finds. To fail a pipeline, ask for it:
+
+```bash
+maishac scan src/ --fail-on major     # blocker|critical|major|minor|info|any|none
+maishac gate src/                     # alias of: scan --fail-on any
+maishac scan src/ --fail-on any --allow-degraded
+```
+
+| Exit | Meaning |
+|---|---|
+| 0 | No open finding at or above the threshold, and the analysis was complete |
+| 1 | Open findings at or above `--fail-on` (also: any CLI error such as an unknown session id, a bad argument or a zero-file scan) |
+| 2 | The analysis was **degraded** (an analyzer failed, or a recommended one is not installed) and `--allow-degraded` was not given |
+
+Findings take precedence over degradation (exit 1 beats 2). A degraded pass is
+not a pass: a clean result from a scan that never ran cppcheck says nothing about
+the rules cppcheck covers. Pass `--allow-degraded` only where that is a deliberate
+choice. The scan JSON carries `open_by_severity` and, with the flag, a `gate` block.
+
+## Reading the reports
+
+`compliance_report` / `maishac report`, the Guideline Compliance Summary
+(`misra_compliance_summary`) and the Guideline Enforcement Plan are built from
+recorded evidence, including *which analyzers actually succeeded in the last
+scan* (stored in the `scans` table, with their versions).
+
+| Status / verdict | Meaning |
+|---|---|
+| `Violations` / `Deviations` / `Compliant` / `Disapplied` | Checked in the last scan, with that outcome. A deviation permit that has **expired** no longer counts; the finding is a violation again |
+| `Not checked` | No analyzer that maps to this guideline succeeded in the last recorded scan (or no scan was recorded, or the guideline is reference-only). It says nothing about the code. A not-checked Mandatory guideline is not blocking |
+| `NOT ASSESSED` | No scan has been recorded |
+| `NO VIOLATIONS FOUND IN CHECKED GUIDELINES (N unchecked)` | The only favourable verdict. Appended with `; last scan degraded or incomplete` and/or `WITH DEVIATIONS` when applicable |
+| `NON-COMPLIANT` / `PENDING` | Open violations (or a Mandatory violation or deviation) / fixes recorded but not yet verified |
+
+The Guideline Enforcement Plan's `checked_by` lists only analyzers that map the
+guideline, with `(not installed)` when absent. Reference-only guidelines read
+*"Not enforced by tooling - requires separate method"*. The compliance matrix
+reports `rules_in_kb`, `rules_detectable` and `clean_among_checked`; `clean` is
+strict (every rule detectable and a non-degraded recorded scan).
+`report --format sarif` uses the real Maisha version, exports suppressed and
+deviated findings with SARIF `suppressions`, and includes the column.
+
+## Sessions: states and the audit log
+
+A session ends in one of these states:
+
+| State | Meaning |
+|---|---|
+| `active` | In progress |
+| `awaiting_verification` | Fixes are pending a test run or human sign-off |
+| `converged` | Nothing open in scope (imported findings do not block) |
+| `stalled` / `budget_exhausted` | No progress over the stall window / iteration budget spent |
+| `needs_human` | Every remaining finding is frozen by the oscillation guard |
+| `analysis_incomplete` | The re-scan could not run every analyzer, so "nothing left" cannot be concluded. Not terminal: fix the toolchain and `session verify` again (becomes `budget_exhausted` if the budget is spent) |
+| `aborted` | Ended on purpose with `maishac session abort <id>` / `compliance_abort_session` |
+
+Ended sessions refuse `next_batch`, `verify` and `record_attempt`. `verify`
+respects the session's `--severity-floor` and paths; findings outside are
+reported as `open_out_of_scope`. An open imported finding is reported as
+`open_imported` and named in the reason.
+
+Every approval, suppression, deviation, re-categorization, revocation,
+proposal decision and session start/end is written to an append-only `audit_log`
+(`maishac audit [--json] [--action ...]`, and an audit section in the report).
+Actions made by an MCP agent are marked `[AGENT]`. Nothing in the MCP surface
+can revoke: `maishac unsuppress`, `revoke-deviation` and `uncategorize` are
+CLI-only.
+
+## Upgrading an existing project
+
+`.maishac/memory.db` migrates in place the first time the new version opens it
+(`PRAGMA user_version`, currently 4); no action is needed and old fingerprints
+stay valid. A scan recorded by an older version has no `scans` row, so reports
+show `NOT ASSESSED` / `Not checked` until you run one new scan. See the
+CHANGELOG for behaviour changes.
+
 ## The verification gate
 
 The trap Maisha guards against: the only judge of a fix is the same analyzer
@@ -336,10 +440,14 @@ So a fix does **not** go straight to `resolved`. It enters
 | Policy | A pending fix becomes `resolved` when… |
 |---|---|
 | `analyzer_only` | the analyzer stops flagging it (⚠️ not recommended for compliance work) |
-| `test_gated` | a configured `test_command` exits 0 |
+| `test_gated` | the human-configured test command exits 0 |
 | `human_gated` | a human calls `approve_finding` |
 
-Default: `test_gated` if a `test_command` is configured, else `human_gated`.
+Default: `test_gated` if a test command is configured, else `human_gated`.
+Over MCP, `analyzer_only` is refused and every scan is gated, so an agent cannot
+resolve findings by editing code and rescanning (`MAISHAC_ALLOW_AGENT_APPROVALS=1`
+lifts this; unsafe). A file that vanishes from its path (moved or renamed) does not
+resolve its high-severity findings either: they wait for a person.
 Regardless of policy, **semantic-risk findings** (casts, comparisons, sign
 conversions, control-flow changes) and **high-severity findings** always require
 human approval — a green test suite that never exercises the sentinel case cannot
@@ -364,6 +472,50 @@ maishac session verify <id>          # -> awaiting_verification if fixes need si
 maishac approve <fingerprint> --by lead@example.com
 ```
 
+### Who may sign off: agents propose, humans decide
+
+An agent that can approve its own fixes, suppress the findings it cannot fix, or
+write itself a deviation has no gate at all. So the MCP tools
+`compliance_approve_finding`, `compliance_add_deviation`,
+`compliance_recategorize` and `compliance_suppress_finding` **only create a
+proposal** (status `pending_human`). Nothing changes until a person runs
+
+```bash
+maishac proposals list
+maishac proposals accept <id> --by lead@example.com   # or: reject <id> --by ... -r "why"
+```
+
+(or the direct commands `approve` / `deviate` / `suppress` / `recategorize`).
+The person who accepts is recorded as the approver. Every entry also records its
+`source` (`cli`/`mcp`/`import`), and every sign-off, revocation and session
+start/end goes into an append-only `audit_log` (`maishac audit`, and a short
+section in the markdown report).
+
+Setting `MAISHAC_ALLOW_AGENT_APPROVALS=1` in the MCP server's environment makes
+those tools act directly. **This is unsafe**: the agent then grades its own work.
+Such entries are stored with `source=mcp`, marked `[AGENT-ORIGINATED]` in
+reports, and flagged with a warning. MISRA Mandatory guidelines (judged after
+GRP re-categorization) can never be suppressed or deviated, whatever the mode.
+Suppressions inside a SARIF file are not carried over when an agent starts the
+import; use `maishac import` yourself.
+
+### The test command is human-only
+
+The test command runs on your machine, so an MCP agent cannot set it
+(`compliance_begin_session` has no such argument). Configure it with
+`--test-command`, the `MAISHAC_TEST_COMMAND` environment variable, or
+`{"test_command": "make test", "test_timeout": 600}` in `.maishac/config.json`
+(first one found wins, in that order). It is split with `shlex` and run **without
+a shell**; write `sh -c 'a && b'` if you need pipes or `&&`. The default timeout
+is 600 s (`--test-timeout`, `MAISHAC_TEST_TIMEOUT`); on timeout the whole process
+group is killed.
+
+> `.maishac/config.json` is only human-controlled if the agent **cannot write to
+> the project directory**. An agent with file-write access can edit that file
+> (and the `.maishac/` database) directly. If that matters, run the agent in a
+> sandbox that makes `.maishac/` read-only, or set the command with the flag or
+> the environment variable instead.
+
 ## Teams & concurrency
 
 Project memory lives in a per-project SQLite file, `.maishac/memory.db`.
@@ -379,7 +531,7 @@ Project memory lives in a per-project SQLite file, `.maishac/memory.db`.
 ## Development
 
 ```bash
-pip install -e . && python -m pytest tests/ -q
+pip install -e ".[dev,mcp]" && python -m pytest tests/ -q   # MCP tests skip if the mcp extra is absent
 ```
 
 `examples/bad.c` is a deliberately non-compliant fixture exercising ~18 rules —

@@ -7,15 +7,19 @@ IDE problem panes.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
+import posixpath
 import re
 import time
 from pathlib import Path
+from urllib.parse import unquote
 
+from . import __version__
 from .analyzers.cppcheck import CPPCHECK_TO_CERT
 from .memory import MemoryStore
-from .model import Finding, compute_fingerprint, relpath
+from .model import Finding, assign_occurrences, compute_fingerprint
 from .rules import REGISTRY
 
 _STANDARDS = ["MISRA-C:2012", "BARR-C:2018", "CERT-C"]
@@ -54,19 +58,32 @@ def _resolve_sarif_rule(rule_id: str) -> dict | None:
     return None
 
 
-def _norm_uri(uri: str) -> str:
-    """Normalize a SARIF artifactLocation URI to a project-relative-ish path:
-    strip file:// schemes and leading ./ so fingerprints and file lookups are
-    stable across engines that emit absolute/scheme-prefixed URIs."""
+def _norm_uri(uri: str, root: Path | None = None) -> str:
+    """Normalize a SARIF artifactLocation URI to a project-relative POSIX path:
+    strip ``file://``, percent-decode, turn backslashes into slashes, drop a
+    leading ``./``, and make an absolute path inside ``root`` relative to it.
+    The result is the one value used for both a finding's ``file`` and its
+    fingerprint, so it is identical whatever form the engine emitted."""
     if not uri:
         return ""
-    if uri.startswith("file://"):
-        uri = uri[7:]
-        if len(uri) > 2 and uri[0] == "/" and uri[2] == ":":  # file:///C:/...
-            uri = uri[1:]
+    if uri.startswith("file:"):
+        uri = uri[5:]
+        if uri.startswith("//"):
+            uri = uri[2:]
+            if not uri.startswith("/"):      # file://host/path -> drop the authority
+                uri = "/" + uri.split("/", 1)[1] if "/" in uri else ""
+    uri = unquote(uri).replace("\\", "/")
+    if len(uri) > 2 and uri[0] == "/" and uri[2] == ":":  # /C:/... from file:///C:/...
+        uri = uri[1:]
+    if root is not None and (uri.startswith("/") or (len(uri) > 1 and uri[1] == ":")):
+        try:
+            return Path(uri).resolve().relative_to(Path(root).resolve()).as_posix()
+        except (ValueError, OSError):
+            pass
+    uri = posixpath.normpath(uri) if uri else ""
     while uri.startswith("./"):
         uri = uri[2:]
-    return uri
+    return "" if uri == "." else uri
 
 
 def _run_indexes(run: dict) -> tuple[list[dict], list[list[dict]]]:
@@ -153,7 +170,7 @@ def parse_sarif(data: dict, root: Path) -> list[Finding]:
 
             desc = _result_descriptor(res, rules)
             phys = _primary_location(res)
-            uri = _norm_uri((phys.get("artifactLocation") or {}).get("uri") or "")
+            uri = _norm_uri((phys.get("artifactLocation") or {}).get("uri") or "", root)
             region = phys.get("region") or {}
             line = int(region.get("startLine") or 0)
             col = int(region.get("startColumn") or 0)
@@ -181,7 +198,7 @@ def parse_sarif(data: dict, root: Path) -> list[Finding]:
             fp = (res.get("partialFingerprints") or {}).get("maishac/v1")
             if not fp:
                 if line_content:
-                    fp = compute_fingerprint(rid, relpath(root / uri, root), line_content)
+                    fp = compute_fingerprint(rid, uri, line_content)
                 else:
                     # ponytail: no source line to anchor to — fall back to a
                     # location+message hash. Not line-stable, but external SARIF
@@ -196,7 +213,28 @@ def parse_sarif(data: dict, root: Path) -> list[Finding]:
                 column=col, message=msg, analyzer=f"sarif:{tool}",
                 line_content=line_content, fix_hint=fix, fingerprint=fp,
                 code_flow=_parse_code_flows(res), suppression=_parse_suppression(res)))
-    return findings
+    return assign_occurrences(findings)
+
+
+def sarif_scope(data: dict, root: Path) -> dict[str, set[str]]:
+    """tool name (``sarif:<driver>``) -> project-relative files its run covers:
+    every artifact it lists and every file any of its results (even one a
+    baseline marks absent) points at. A re-import may only resolve findings in
+    these files; a file the run never mentions was simply not analyzed."""
+    out: dict[str, set[str]] = {}
+    for run in data.get("runs", []):
+        driver = (run.get("tool") or {}).get("driver") or {}
+        files = out.setdefault(f"sarif:{(driver.get('name') or 'sarif').lower()}", set())
+        for art in run.get("artifacts") or []:
+            uri = _norm_uri(((art.get("location") or {}).get("uri")) or "", root)
+            if uri:
+                files.add(uri)
+        for res in run.get("results", []):
+            uri = _norm_uri((_primary_location(res).get("artifactLocation") or {})
+                            .get("uri") or "", root)
+            if uri:
+                files.add(uri)
+    return out
 
 
 def _parse_suppression(res: dict) -> dict:
@@ -244,27 +282,177 @@ def _read_line(path: Path, line: int) -> str:
         return ""
 
 
+def last_scan_info(mem: MemoryStore) -> dict:
+    """What the most recent analysis run did, for every report that draws a
+    conclusion. `recorded` False means no scan/verify was ever logged, so
+    nothing in memory has been checked by this harness. `checked_analyzers` are
+    the analyzers whose clean output counts as evidence: they ran, did not fail
+    (or partly fail), and the run covered at least one file."""
+    last = mem.last_scan()
+    imp = mem.last_scan(("import",))
+    info = {"recorded": last is not None, "degraded": None, "ts": None, "kind": None,
+            "paths": [], "files_scanned": 0, "analyzers_used": [],
+            "analyzers_failed": [], "checked_analyzers": [], "versions": {},
+            "maishac_version": None,
+            "last_import": ({"ts": imp["ts"], "sources": imp["paths"], "tools": imp["analyzers_used"]}
+                            if imp else None)}
+    if last:
+        failed = sorted({e.get("analyzer", "") for e in last["analyzers_failed"]})
+        used = list(last["analyzers_used"])
+        info.update(
+            degraded=last["degraded"], ts=last["ts"], kind=last["kind"],
+            paths=last["paths"], files_scanned=last["files_scanned"],
+            analyzers_used=used, analyzers_failed=failed,
+            errors=last["analyzers_failed"],
+            checked_analyzers=([] if not last["files_scanned"]
+                               else sorted(set(used) - set(failed))),
+            versions=(last["toolchain"] or {}).get("versions", {}),
+            maishac_version=last["maishac_version"])
+    return info
+
+
+def _fmt_ts(ts) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts)) if ts else "never"
+
+
+def _last_scan_lines(info: dict) -> list[str]:
+    """Markdown bullet lines stating what the last scan covered."""
+    if not info["recorded"]:
+        return ["- **No scan recorded.** Nothing in this report was produced by a "
+                "Maisha analysis run; run `maishac scan` first."]
+    L = [f"- Last {info['kind']}: {_fmt_ts(info['ts'])} · {info['files_scanned']} file(s) · "
+         f"paths: {', '.join(info['paths']) or '—'} · Maisha {info['maishac_version']}",
+         "- Analyzers used: " + (", ".join(
+             f"{a} ({info['versions'][a]})" if a in info["versions"] else a
+             for a in info["analyzers_used"]) or "none")]
+    if info["analyzers_failed"]:
+        L.append("- **Analyzers that failed or partly failed: "
+                 + ", ".join(info["analyzers_failed"])
+                 + ".** Their guidelines are reported as not checked.")
+    if info["degraded"]:
+        L.append("- **The last scan ran with a degraded toolchain** (missing or "
+                 "deselected analyzers, or an analyzer failure).")
+    if info["last_import"]:
+        L.append(f"- Last SARIF import: {_fmt_ts(info['last_import']['ts'])} "
+                 f"({', '.join(info['last_import']['tools']) or 'no results'})")
+    return L
+
+
 def compliance_matrix(mem: MemoryStore) -> dict:
+    from .coverage import enforced_ids
     rows = [dict(r) for r in mem.db.execute("SELECT * FROM findings")]
+    last = last_scan_info(mem)
+    enforced = enforced_ids()
     matrix = {}
     for std in _STANDARDS:
-        checked = set(REGISTRY.all_ids(std))
+        in_kb = set(REGISTRY.all_ids(std))
+        detectable = in_kb & enforced
         violated = {r["rule_id"] for r in rows
                     if r["standard"] == std and r["status"] in ("open", "regressed")}
-        deviated = {d["rule_id"] for d in mem.deviations() if d["rule_id"] in checked}
+        deviated = {d["rule_id"] for d in mem.deviations() if d["rule_id"] in in_kb}
+        n_pending = sum(1 for r in rows if r["standard"] == std
+                        and r["status"] == "pending_verification")
+        clean_among_checked = not violated and not n_pending
         matrix[std] = {
-            "rules_checked": len(checked),
+            # Legacy key. It always meant "rules in the knowledge base", not
+            # "rules a scan examined"; kept for consumers, see the two below.
+            "rules_checked": len(in_kb),
+            "rules_in_kb": len(in_kb),
+            "rules_detectable": len(detectable),
             "rules_violated": sorted(violated),
             "rules_deviated": sorted(deviated),
             "open_findings": sum(1 for r in rows if r["standard"] == std
                                  and r["status"] in ("open", "regressed")),
-            "pending_verification": sum(1 for r in rows if r["standard"] == std
-                                        and r["status"] == "pending_verification"),
+            "pending_verification": n_pending,
             "resolved_findings": sum(1 for r in rows if r["standard"] == std
                                      and r["status"] == "resolved"),
-            "clean": not violated,
+            # No open violation and no unconfirmed fix, among what was checked.
+            "clean_among_checked": clean_among_checked,
+            # Strict: also nothing unchecked, a scan on record, and that scan
+            # neither degraded nor failed. Almost never true, on purpose.
+            "clean": (clean_among_checked and len(detectable) == len(in_kb)
+                      and last["recorded"] and not last["degraded"]),
+            "analysis_recorded": last["recorded"],
+            "analysis_degraded": bool(last["degraded"]),
         }
     return matrix
+
+
+def _expired(d: dict, now: float | None = None) -> bool:
+    return bool(d.get("expires")) and d["expires"] < (time.time() if now is None else now)
+
+
+def _mark(row: dict) -> str:
+    """Flag a sign-off that did not come from a person at the CLI."""
+    src = (row.get("source") or row.get("approval_source")
+           or ("legacy" if row.get("approved_by") else "cli"))
+    if src == "mcp":
+        return " **[AGENT-ORIGINATED via MCP]**"
+    if src == "legacy":
+        return " **[ORIGIN UNKNOWN: recorded before provenance tracking]**"
+    if src == "import":
+        return " *[from SARIF import]*"
+    return ""
+
+
+def agent_signoffs(mem: MemoryStore) -> dict:
+    """Every approval, deviation, suppression and re-categorization an MCP agent
+    applied directly (only possible with MAISHAC_ALLOW_AGENT_APPROVALS=1)."""
+    db = mem.db
+    return {
+        "approvals": [dict(r) for r in db.execute(
+            "SELECT fingerprint, rule_id, approved_by FROM findings"
+            " WHERE approval_source='mcp'")],
+        "deviations": [dict(r) for r in db.execute(
+            "SELECT id, rule_id, scope FROM deviations WHERE source='mcp' AND revoked_at IS NULL")],
+        "suppressions": [dict(r) for r in db.execute(
+            "SELECT fingerprint, reason FROM suppressions WHERE source='mcp'")],
+        "recategorizations": [dict(r) for r in db.execute(
+            "SELECT rule_id, to_category FROM recategorizations WHERE source='mcp'")],
+    }
+
+
+def legacy_signoffs(mem: MemoryStore) -> int:
+    """Waivers and approvals recorded before provenance tracking existed (schema
+    v5 migration). An MCP agent could have written any of them, so a report must
+    not present them as human decisions."""
+    db = mem.db
+    return sum(db.execute(q).fetchone()[0] for q in (
+        "SELECT COUNT(*) FROM findings WHERE approval_source='legacy'",
+        "SELECT COUNT(*) FROM deviations WHERE source='legacy' AND revoked_at IS NULL",
+        "SELECT COUNT(*) FROM suppressions WHERE source='legacy'",
+        "SELECT COUNT(*) FROM recategorizations WHERE source='legacy'"))
+
+
+def _audit_lines(mem: MemoryStore, limit: int = 15) -> list[str]:
+    rows = mem.audit_entries(limit)
+    pending = mem.proposals()
+    L = ["", "## Audit trail", ""]
+    ag = agent_signoffs(mem)
+    n_agent = sum(len(v) for v in ag.values())
+    if n_agent:
+        L += [f"> **WARNING: {n_agent} sign-off(s) were applied directly by an MCP agent** "
+              "(MAISHAC_ALLOW_AGENT_APPROVALS was enabled), not by a person. They are "
+              "marked below; review them before relying on this report.", ""]
+    n_legacy = legacy_signoffs(mem)
+    if n_legacy:
+        L += [f"> **NOTE: {n_legacy} sign-off(s) predate provenance tracking** (marked "
+              "`legacy`). Earlier versions let MCP tools write them directly, so it is "
+              "unknown whether a person made them. Review them, then re-record or "
+              "revoke the ones you do not stand behind.", ""]
+    if pending:
+        L += [f"{len(pending)} agent proposal(s) are awaiting a human decision "
+              "(`maishac proposals list`).", ""]
+    if not rows:
+        return L + ["No sign-offs recorded."]
+    L += ["| Time | Source | Action | Actor | Target |", "|---|---|---|---|---|"]
+    for r in rows:
+        flag = " **[AGENT]**" if r["source"] == "mcp" else ""
+        L.append(f"| {_fmt_ts(r['ts'])} | {r['source']}{flag} | {r['action']} | "
+                 f"{r['actor'] or '—'} | `{r['target']}` |")
+    L += ["", f"Showing the latest {len(rows)} entries; the full append-only log is "
+              "`maishac audit`."]
+    return L
 
 
 def markdown_report(mem: MemoryStore, project_name: str = "") -> str:
@@ -281,16 +469,25 @@ def markdown_report(mem: MemoryStore, project_name: str = "") -> str:
         f"Deviations on record: {stats['deviations']} · Suppressions: {stats['suppressions']}"
         f" · Fix attempts logged: {stats['fix_attempts']}",
         "",
+        "## Last scan",
+        "",
+        *_last_scan_lines(last_scan_info(mem)),
+        "",
         "## Standards matrix",
         "",
-        "| Standard | Rules checked | Open | Pending | Resolved | Violated rules | Deviated rules | Clean |",
-        "|---|---|---|---|---|---|---|---|",
+        "*Clean among checked* = no open violation and no unconfirmed fix. *Clean* "
+        "additionally requires every rule in the knowledge base to be detectable, "
+        "and a recorded, non-degraded scan; a rule no analyzer checks is not clean.",
+        "",
+        "| Standard | Rules in KB | Detectable | Open | Pending | Resolved | Violated rules | Deviated rules | Clean among checked | Clean |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for std, m in matrix.items():
         lines.append(
-            f"| {std} | {m['rules_checked']} | {m['open_findings']} | "
+            f"| {std} | {m['rules_in_kb']} | {m['rules_detectable']} | {m['open_findings']} | "
             f"{m['pending_verification']} | {m['resolved_findings']} | "
             f"{', '.join(m['rules_violated']) or '—'} | {', '.join(m['rules_deviated']) or '—'} | "
+            f"{'yes' if m['clean_among_checked'] else 'no'} | "
             f"{'yes' if m['clean'] else 'no'} |")
     lines += ["", "## Open findings", ""]
     opens = mem.open_findings(limit=500)
@@ -304,7 +501,18 @@ def markdown_report(mem: MemoryStore, project_name: str = "") -> str:
         lines += ["", "## Deviation register", ""]
         for d in devs:
             lines.append(f"- **{d['rule_id']}** scope `{d['scope']}` — {d['justification']}"
-                         f"{(' (approved by ' + d['approver'] + ')') if d['approver'] else ''}")
+                         f"{(' (approved by ' + d['approver'] + ')') if d['approver'] else ''}"
+                         f"{_mark(d)}"
+                         f"{' **[EXPIRED ' + _fmt_ts(d['expires'])[:10] + ']**' if _expired(d) else ''}")
+    supps = mem.suppressions()
+    if supps:
+        lines += ["", "## Suppressions", ""]
+        for sp in supps:
+            exp = (" **[EXPIRED]**" if sp.get("expires") and sp["expires"] < time.time() else "")
+            lines.append(f"- `{sp['fingerprint']}` — {sp['reason']}"
+                         f"{(' (by ' + sp['approver'] + ')') if sp.get('approver') else ''}"
+                         f"{_mark(sp)}{exp}")
+    lines += _audit_lines(mem)
     return "\n".join(lines) + "\n"
 
 
@@ -328,17 +536,61 @@ def _code_flows_to_sarif(steps: list[dict]) -> list[dict]:
         }} for s in steps]}]}]
 
 
+_SARIF_LEVEL = {"blocker": "error", "critical": "error", "major": "warning",
+                "minor": "note", "info": "note"}
+
+
+def _sarif_suppression(mem: MemoryStore, f: dict) -> dict | None:
+    """SARIF `suppressions` entry for a suppressed/deviated finding, or None if
+    the finding has no live justification (e.g. its deviation permit expired,
+    so it must be reported as the violation it again is).
+
+    kind is "external": both the suppression and the deviation register live in
+    Maisha's memory, not in an in-source comment (SARIF kind "inSource")."""
+    if f["status"] == "suppressed":
+        r = mem.db.execute("SELECT reason, ts, approver, source FROM suppressions"
+                           " WHERE fingerprint=?", (f["fingerprint"],)).fetchone()
+        return {"kind": "external", "status": "accepted",
+                "justification": r["reason"] if r else "suppressed in Maisha memory",
+                "properties": {"maishac/origin": "suppression",
+                               "maishac/source": (r["source"] if r else "cli"),
+                               "maishac/approver": (r["approver"] if r else "") or ""}}
+    if f["status"] == "deviated":
+        d = mem.matching_deviation(f["rule_id"], f["file"])
+        if not d:
+            return None
+        return {"kind": "external", "status": "accepted",
+                "justification": d["justification"],
+                "properties": {"maishac/origin": "deviation", "maishac/deviationId": d["id"],
+                               "maishac/source": d.get("source") or "cli",
+                               "maishac/approver": d.get("approver") or ""}}
+    return None
+
+
 def sarif(mem: MemoryStore) -> dict:
-    opens = mem.open_findings(limit=100000)
+    """SARIF 2.1.0 export. Open/regressed findings are live results. Suppressed
+    findings and findings covered by a live deviation permit are exported too,
+    carrying a SARIF `suppressions` entry, so a consumer sees the whole triage
+    state instead of a list that quietly omits everything waived. Findings
+    pending verification are not results (the analyzer no longer flags them);
+    their count is on the run's `properties`."""
+    rows = mem.open_findings(limit=100000)
+    rows += [dict(r) for r in mem.db.execute(
+        "SELECT * FROM findings WHERE status IN ('suppressed','deviated')"
+        " ORDER BY file, line")]
     rules_seen, results = {}, []
-    for f in opens:
+    for f in rows:
+        supp = None
+        if f["status"] in ("suppressed", "deviated"):
+            supp = _sarif_suppression(mem, f)
+            if supp is None and f["status"] == "suppressed":
+                continue
         rid = f["rule_id"]
         rules_seen.setdefault(rid, _rule_descriptor(rid, f["message"]))
         meta = REGISTRY.get(rid) or {}
         result = {
             "ruleId": rid,
-            "level": {"blocker": "error", "critical": "error",
-                      "major": "warning", "minor": "note", "info": "note"}.get(f["severity"], "warning"),
+            "level": _SARIF_LEVEL.get(f["severity"], "warning"),
             "message": {"text": f["message"] or meta.get("summary", "")},
             "partialFingerprints": {"maishac/v1": f["fingerprint"]},
             "locations": [{
@@ -348,6 +600,8 @@ def sarif(mem: MemoryStore) -> dict:
                                **({"startColumn": f["column"]} if f.get("column") else {})},
                 }}],
         }
+        if supp:
+            result["suppressions"] = [supp]
         # Carry an imported qualified-engine data-flow path back out, so an
         # import -> export round-trip preserves it.
         flow = f.get("code_flow")
@@ -370,13 +624,20 @@ def sarif(mem: MemoryStore) -> dict:
             rels.append({"target": {"id": ref}, "kinds": ["relevant"]})
         rules_seen[rid]["relationships"] = rels
 
+    last = last_scan_info(mem)
     return {
         "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
         "version": "2.1.0",
         "runs": [{
-            "tool": {"driver": {"name": "Maisha", "version": "0.3.1",
+            "tool": {"driver": {"name": "Maisha", "version": __version__,
                                   "rules": list(rules_seen.values())}},
             "results": results,
+            "properties": {
+                "maishac/pendingVerification": mem.count_pending(),
+                "maishac/analysisRecorded": last["recorded"],
+                "maishac/analysisDegraded": bool(last["degraded"]),
+                "maishac/analyzersFailed": last["analyzers_failed"],
+            },
         }],
     }
 
@@ -392,9 +653,15 @@ def sarif(mem: MemoryStore) -> dict:
 # evidence*, not a certification — see the disclaimer in the rendered report.
 
 _MISRA_STD = "MISRA-C:2012"
-# Approx size of the full guideline set (143 rules + 16 directives + Amendment
-# 1/2/3 security rules). Used only to state honest coverage, never to score.
-_MISRA_UNIVERSE = 175
+# APPROXIMATE size of the full MISRA C:2012 guideline set: 143 rules + 16
+# directives = 159 in the base standard, plus the rules added by Amendments 1-4
+# and the Technical Corrigenda, rounded to a documented working figure. The exact
+# count depends on which amendments an organisation adopts, so every report that
+# shows it says "~". It is used only to state honest coverage ("catalogued N of
+# roughly 175"), never to score compliance. README/COVERAGE.md quote the same
+# figure; change it here and in tools/gen_coverage.py together.
+MISRA_C_2012_APPROX_GUIDELINES = 175
+_MISRA_UNIVERSE = MISRA_C_2012_APPROX_GUIDELINES
 
 
 def _coverage_breakdown() -> dict:
@@ -445,20 +712,45 @@ def _coverage_breakdown() -> dict:
 
 _STATUS_KEY = {"Compliant": "compliant", "Deviations": "deviations",
                "Violations": "violations", "Pending verification": "pending",
-               "Disapplied": "disapplied"}
+               "Disapplied": "disapplied", "Not checked": "not_checked"}
+
+
+def _checkers(gid: str, native: set[str]) -> list[str]:
+    """Analyzer names (no '(partial)' suffix) that map a check onto `gid`."""
+    from .coverage import analyzers_for
+    return [m.split(" ")[0] for m in analyzers_for(gid, native)]
 
 
 def misra_compliance_summary(mem: MemoryStore) -> dict:
+    """Per-guideline status from recorded evidence.
+
+    "Compliant" means a recorded scan ran an analyzer that checks the guideline
+    and found nothing. A guideline no analyzer checked (reference-only, or its
+    analyzer was not installed, not selected, failed or partly failed in the
+    last scan, or no scan was ever recorded) is "Not checked": unexamined, not
+    compliant. Findings from any source (including imported SARIF) still make a
+    guideline Violations/Pending/Deviations regardless of the scan log.
+    """
+    from .coverage import analyzers_for, native_ids
+    now = time.time()
     rows = [dict(r) for r in mem.db.execute(
-        "SELECT rule_id, status FROM findings WHERE standard=?", (_MISRA_STD,))]
+        "SELECT rule_id, status, file FROM findings WHERE standard=?", (_MISRA_STD,))]
     dev_by_rule: dict[str, list] = {}
     for d in mem.deviations():
         dev_by_rule.setdefault(d["rule_id"], []).append(d)
     recats = mem.recategorizations()  # GRP: rule_id -> {to_category, ...}
+    last = last_scan_info(mem)
+    ran = set(last["checked_analyzers"])
+    native = native_ids()
+
+    def live_permit(rule, file):
+        return any(not _expired(d, now) and fnmatch.fnmatch(file, d["scope"])
+                   for d in dev_by_rule.get(rule, []))
 
     enforced = REGISTRY.all_ids(_MISRA_STD)
     guidelines, blocking = [], []
-    counts = {"compliant": 0, "deviations": 0, "violations": 0, "pending": 0, "disapplied": 0}
+    counts = {"compliant": 0, "deviations": 0, "violations": 0, "pending": 0,
+              "disapplied": 0, "not_checked": 0}
     for gid in enforced:
         meta = REGISTRY.get(gid) or {}
         base_cat = meta.get("category", "required")
@@ -467,8 +759,22 @@ def misra_compliance_summary(mem: MemoryStore) -> dict:
         gr = [r for r in rows if r["rule_id"] == gid]
         open_v = sum(1 for r in gr if r["status"] in ("open", "regressed"))
         pending = sum(1 for r in gr if r["status"] == "pending_verification")
-        deviated = sum(1 for r in gr if r["status"] == "deviated")
-        permits = dev_by_rule.get(gid, [])
+        # A 'deviated' row only counts while a live permit still covers it; one
+        # whose permit expired is a violation again even before the next rescan.
+        deviated = 0
+        for r in gr:
+            if r["status"] == "deviated":
+                if live_permit(gid, r["file"]):
+                    deviated += 1
+                else:
+                    open_v += 1
+        permits_all = dev_by_rule.get(gid, [])
+        permits = [d for d in permits_all if not _expired(d, now)]
+        expired = len(permits_all) - len(permits)
+
+        mapped = _checkers(gid, native)
+        checked_by = sorted(set(mapped) & ran)
+        checked = bool(checked_by)
 
         if cat == "disapplied":
             # Removed from the compliance argument by an agreed GRP entry;
@@ -478,36 +784,62 @@ def misra_compliance_summary(mem: MemoryStore) -> dict:
             status = "Violations"
         elif pending:
             status = "Pending verification"
-        elif deviated or permits:
+        elif deviated or (permits and checked):
             status = "Deviations"
+        elif not checked:
+            status = "Not checked"
         else:
             status = "Compliant"
 
-        # A Mandatory guideline (post-GRP) can be neither deviated nor left in violation.
-        is_blocking = cat == "mandatory" and status not in ("Compliant",)
+        # A Mandatory guideline (post-GRP) can be neither deviated nor left in
+        # violation. Not-checked is unexamined, not a violation, so not blocking.
+        is_blocking = cat == "mandatory" and status in (
+            "Violations", "Deviations", "Pending verification")
         if is_blocking:
             blocking.append(gid)
         counts[_STATUS_KEY[status]] += 1
+        if not mapped:
+            why = "reference-only: no analyzer checks it"
+        elif checked:
+            why = ""
+        elif not last["recorded"]:
+            why = "no scan recorded"
+        else:
+            why = ("its analyzer (" + ", ".join(mapped) + ") was not installed, not "
+                   "selected, or failed in the last scan")
         guidelines.append({
             "guideline": gid, "category": cat, "base_category": base_cat,
             "recategorized": bool(recat), "status": status,
             "open": open_v, "pending": pending, "deviated": deviated,
-            "permits": len(permits), "blocking": is_blocking,
+            "permits": len(permits), "expired_permits": expired,
+            "blocking": is_blocking,
+            "checked": checked, "checked_by": checked_by,
+            "partial_check": checked and any(
+                m.endswith("(partial)") for m in analyzers_for(gid, native)),
+            "not_checked_reason": why,
             "summary": meta.get("summary", ""),
         })
 
+    coverage = _coverage_breakdown()
+    unchecked = counts["not_checked"] + coverage["not_carried"]
+    scan_bad = bool(last["degraded"] or last["analyzers_failed"])
     if blocking:
         verdict = "NON-COMPLIANT — a Mandatory guideline is violated or deviated"
     elif counts["violations"]:
         verdict = "NON-COMPLIANT — open violations without a deviation permit"
     elif counts["pending"]:
         verdict = "PENDING — fixes recorded but not yet verified"
+    elif not last["recorded"]:
+        verdict = "NOT ASSESSED — no scan recorded"
+    elif unchecked or scan_bad:
+        verdict = (f"NO VIOLATIONS FOUND IN CHECKED GUIDELINES ({unchecked} unchecked"
+                   + ("; last scan degraded or incomplete" if scan_bad else "") + ")"
+                   + (" WITH DEVIATIONS" if counts["deviations"] else ""))
     elif counts["deviations"]:
         verdict = "COMPLIANT WITH DEVIATIONS"
     else:
         verdict = "COMPLIANT"
 
-    coverage = _coverage_breakdown()
     return {
         "standard": _MISRA_STD,
         "verdict": verdict,
@@ -519,11 +851,13 @@ def misra_compliance_summary(mem: MemoryStore) -> dict:
         "enforced": coverage["detectable"],
         "carried": coverage["carried"],
         "not_checked": coverage["reference_only"] + coverage["not_carried"],
+        "unchecked_guidelines": unchecked,
         "universe": _MISRA_UNIVERSE,
         "coverage": coverage,
+        "last_scan": last,
         "counts": counts,
         "guidelines": guidelines,
-        "deviation_permits": mem.deviations(),
+        "deviation_permits": [{**d, "expired": _expired(d, now)} for d in mem.deviations()],
         "recategorizations": list(recats.values()),
         "blocking_guidelines": blocking,
     }
@@ -558,7 +892,12 @@ def misra_compliance_markdown(mem: MemoryStore, project_name: str = "") -> str:
         "must be assigned an enforcement method of its own.",
         f"- Compliant: **{c['compliant']}** · With deviations: **{c['deviations']}** · "
         f"Pending verification: **{c['pending']}** · In violation: **{c['violations']}** · "
-        f"Disapplied (GRP): **{c['disapplied']}**",
+        f"Disapplied (GRP): **{c['disapplied']}** · "
+        f"Not checked: **{c['not_checked']}**",
+        "",
+        "### Last scan",
+        "",
+        *_last_scan_lines(s["last_scan"]),
     ]
     if s["blocking_guidelines"]:
         L += ["", "> ⚠ **Audit-blocking:** Mandatory guideline(s) not compliant — "
@@ -569,12 +908,16 @@ def misra_compliance_markdown(mem: MemoryStore, project_name: str = "") -> str:
           "", "| Guideline | Category | Status | Open | Pending | Deviated | Permits |",
           "|---|---|---|---|---|---|---|"]
     order = {"Violations": 0, "Pending verification": 1, "Deviations": 2,
-             "Disapplied": 3, "Compliant": 4}
+             "Disapplied": 3, "Compliant": 4, "Not checked": 5}
     for g in sorted(s["guidelines"], key=lambda g: (order[g["status"]], g["guideline"])):
         mark = "🚫 " if g["blocking"] else ""
         cat = g["category"] + (" *(re-cat)*" if g["recategorized"] else "")
-        L.append(f"| {g['guideline']} | {cat} | {mark}{g['status']} | "
-                 f"{g['open']} | {g['pending']} | {g['deviated']} | {g['permits']} |")
+        status = g["status"] + (" *(partial check)*" if g["status"] == "Compliant"
+                                and g["partial_check"] else "")
+        permits_cell = str(g["permits"]) + (f" (+{g['expired_permits']} expired)"
+                                            if g["expired_permits"] else "")
+        L.append(f"| {g['guideline']} | {cat} | {mark}{status} | "
+                 f"{g['open']} | {g['pending']} | {g['deviated']} | {permits_cell} |")
 
     permits = s["deviation_permits"]
     L += ["", "## Deviation permits", ""]
@@ -585,7 +928,9 @@ def misra_compliance_markdown(mem: MemoryStore, project_name: str = "") -> str:
               "|---|---|---|---|---|"]
         for d in permits:
             exp = time.strftime("%Y-%m-%d", time.localtime(d["expires"])) if d.get("expires") else "—"
-            appr = d.get("approver") or "**UNAPPROVED**"
+            if d.get("expired"):
+                exp += " **EXPIRED (not counted)**"
+            appr = (d.get("approver") or "**UNAPPROVED**") + _mark(d)
             L.append(f"| {d['rule_id']} | `{d['scope']}` | {d['justification']} | {appr} | {exp} |")
 
     L += ["", "---", "",
@@ -650,25 +995,52 @@ def enforcement_tools(mem: MemoryStore) -> list[dict]:
     return tools
 
 
+_NO_TOOLING = "Not enforced by tooling - requires separate method"
+
+
 def guideline_enforcement_plan(mem: MemoryStore) -> dict:
+    from .coverage import analyzers_for, native_ids
     summary = misra_compliance_summary(mem)
     tools = enforcement_tools(mem)
-    tool_names = [t["tool"] for t in tools]
-    # which guidelines have an observed detection in this project (strong evidence)
-    observed = {r["rule_id"] for r in mem.db.execute(
-        "SELECT DISTINCT rule_id FROM findings WHERE standard=?", (_MISRA_STD,))}
+    installed = {t["tool"] for t in tools if t.get("version") != "not installed"}
+    native = native_ids()
+    # which guidelines have an observed detection in this project (strong
+    # evidence), and which tool produced it (covers imported SARIF engines)
+    observed: dict[str, set[str]] = {}
+    for r in mem.db.execute("SELECT DISTINCT rule_id, analyzer FROM findings WHERE standard=?",
+                            (_MISRA_STD,)):
+        observed.setdefault(r["rule_id"], set()).add(r["analyzer"] or "")
     rows = []
     for g in summary["guidelines"]:
         gid = g["guideline"]
+        # Only tools that actually map a check onto this guideline, each marked
+        # when it is not installed (so the check cannot have run here).
+        mapped = [m.split(" ")[0] for m in analyzers_for(gid, native)]
+        checked_by = [m if m in installed else f"{m} (not installed)" for m in mapped]
+        imported = sorted(a for a in observed.get(gid, ()) if a.startswith("sarif:"))
+        checked_by += imported
+        if mapped and any(m in installed for m in mapped):
+            method = "Static analysis"
+        elif mapped:
+            method = "Static analysis (tool not installed here - not checked)"
+        elif imported:
+            method = "Imported qualified engine (SARIF)"
+        else:
+            method = _NO_TOOLING
+        if gid in observed:
+            evidence = "observed in project"
+        elif mapped and any(m in installed for m in mapped):
+            evidence = "check mapped; no violation observed in this project"
+        else:
+            evidence = "none"
         rows.append({
             "guideline": gid, "category": g["category"],
-            "method": "Static analysis",
-            "checked_by": tool_names,
-            "evidence": "observed in project" if gid in observed else "configured (tooling covers it)",
+            "method": method, "checked_by": checked_by, "evidence": evidence,
         })
     return {"standard": _MISRA_STD, "tools": tools, "guidelines": rows,
             "enforced": summary["enforced"], "not_checked": summary["not_checked"],
-            "universe": summary["universe"], "coverage": summary["coverage"]}
+            "universe": summary["universe"], "coverage": summary["coverage"],
+            "last_scan": summary["last_scan"]}
 
 
 def guideline_enforcement_markdown(mem: MemoryStore, project_name: str = "") -> str:
@@ -686,7 +1058,6 @@ def guideline_enforcement_markdown(mem: MemoryStore, project_name: str = "") -> 
         "|---|---|---|---|---|",
     ]
     for t in gep["tools"]:
-        status = t.get("status", "available")
         mark = "**NOT INSTALLED**" if t.get("version") == "not installed" else "available"
         L.append(f"| {t['tool']} | {t['version']} | {t['options']} | {t['kind']} | {mark} |")
     if not gep["tools"]:
@@ -702,6 +1073,8 @@ def guideline_enforcement_markdown(mem: MemoryStore, project_name: str = "") -> 
                 "checked at all** — they are neither compliant nor in violation, they "
                 "are unexamined. Install the missing analyzers and regenerate before "
                 "presenting this plan as evidence."]
+
+    L += ["", "## Last scan", "", *_last_scan_lines(gep["last_scan"])]
 
     L += ["", "## Per-guideline enforcement", "",
           f"This plan covers the **{gc['detectable_here']}** guidelines the "
@@ -727,9 +1100,11 @@ def guideline_enforcement_markdown(mem: MemoryStore, project_name: str = "") -> 
 
     L += ["", "---", "",
           "*Detection evidence:* \"observed in project\" means at least one violation "
-          "of that guideline was produced by the tooling on this codebase. Maisha's "
-          "own regression tests and `examples/bad.c` provide standing evidence that "
-          "the native analyzer detects the guidelines it claims.",
+          "of that guideline was produced by the tooling on this codebase. \"check "
+          "mapped\" means an installed analyzer has a check for it that has not fired "
+          "here; Maisha's own regression tests and `examples/bad.c` are the standing "
+          "evidence the native analyzer detects the guidelines it claims. \"none\" "
+          "means no evidence the guideline is examined at all.",
           "",
           "*Disclaimer:* Maisha is a workflow/orchestration layer, not a "
           "qualified/proven-in-use analysis tool. For tool-qualification evidence "
@@ -766,6 +1141,6 @@ def guideline_recategorization_markdown(mem: MemoryStore, project_name: str = ""
     for gid, r in recats.items():
         meta = REGISTRY.get(gid) or {}
         base = meta.get("category", "—")
-        appr = r.get("approver") or "**UNAPPROVED**"
+        appr = (r.get("approver") or "**UNAPPROVED**") + _mark(r)
         L.append(f"| {gid} | {base} | {r['to_category']} | {r['rationale']} | {appr} |")
     return "\n".join(L) + "\n"

@@ -22,9 +22,27 @@ relevant attack surface is local, not network-facing:
 
 - **Subprocess execution** — `maishac scan`/`session verify` shell out to
   `cppcheck` and `clang-tidy` on files you point it at, and `session begin
-  --test-command` runs an arbitrary shell command you configure. Treat
-  `test_command` and scanned paths as trusted input, the same as any other
-  local build tooling.
+  --test-command` runs a command you configure (shlex-split, no shell, 600 s
+  default timeout, process group killed on timeout). The test command can only
+  be set by a human (CLI flag, `MAISHAC_TEST_COMMAND`, `.maishac/config.json`),
+  never through an MCP tool; treat the command, that config file and scanned
+  paths as trusted input, the same as any other local build tooling.
+- **Agent sign-offs** — over MCP, approve/deviate/suppress/recategorize only
+  create proposals a person must accept on the CLI, unless the operator sets
+  `MAISHAC_ALLOW_AGENT_APPROVALS=1` (unsafe; flagged in reports). MISRA Mandatory
+  guidelines can never be suppressed or deviated.
+- **Trust boundary: the MCP surface only.** The sign-off gate assumes the agent can reach Maisha
+  *only* through the MCP tools. An agent with shell access can run `maishac proposals accept` or
+  `maishac approve`, edit `.maishac/config.json` (it sets the test command) or write
+  `.maishac/memory.db` directly, and no check can tell it from a person. Run the agent without
+  shell access to the project, or in a sandbox where those commands and files are out of reach.
+  Under `test_gated`, an agent that can edit the test suite also controls what "passing" means for
+  non-semantic findings; blocker/critical and semantic-risk findings always need a person.
+  MCP-originated scans are always gated (a rescan never resolves a finding by itself) and the
+  `analyzer_only` policy is refused over MCP, unless `MAISHAC_ALLOW_AGENT_APPROVALS=1`.
+  A TTY or token check on `accept`/`approve` was considered and not added: any such secret or
+  terminal is also reachable by a process with shell access, so it would suggest a boundary that
+  does not exist.
 - **SARIF import** (`maishac import`, `compliance_import_sarif`) parses
   external JSON/XML. Only import SARIF files from analyzers you trust.
 - **Project memory** (`.maishac/memory.db`) is a local SQLite file with no

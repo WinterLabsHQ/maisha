@@ -30,11 +30,12 @@ def test_parallel_writers_no_lock_errors_no_lost_writes(tmp_path):
             # way separate processes would — this is what WAL + busy_timeout must
             # survive without "database is locked".
             mem = MemoryStore(proj)
-            barrier.wait()  # maximize contention: everyone writes at once
+            barrier.wait(timeout=30)  # maximize contention: everyone writes at once
             for i in range(per_writer):
                 mem.add_note(f"note {wid}-{i}", topic=f"t{wid}", tags="conc")
         except Exception as e:  # noqa: BLE001 — capture, assert outside the thread
             errors.append(e)
+            barrier.abort()  # a thread that died before the barrier must not hang the rest
 
     threads = [threading.Thread(target=work, args=(w,)) for w in range(writers)]
     for t in threads:
@@ -103,3 +104,28 @@ def test_second_session_is_refused_across_engine_instances(tmp_path):
     # ...but --force overrides for the deliberate case
     c = LoopEngine(proj).begin_session(["src"], {"analyzers": ["native"]}, force=True)
     assert "session_id" in c
+
+
+def test_concurrent_first_open_of_a_fresh_database(tmp_path):
+    """Regression: PRAGMA journal_mode=WAL ran before busy_timeout, so several
+    processes creating the same fresh memory.db at once could fail with
+    "database is locked"."""
+    for round_ in range(25):
+        proj = tmp_path / f"p{round_}"
+        proj.mkdir()
+        errors: list[Exception] = []
+        start = threading.Barrier(8)
+
+        def opener():
+            try:
+                start.wait(timeout=30)
+                MemoryStore(proj)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        threads = [threading.Thread(target=opener) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors, f"round {round_}: {errors!r}"

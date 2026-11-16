@@ -5,6 +5,207 @@ All notable changes to Maisha are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Behaviour changes for existing users
+
+Read these before upgrading; each is also listed under Added/Changed/Fixed/Security below.
+
+- **Report verdict wording changed.** `COMPLIANT` / `COMPLIANT WITH DEVIATIONS` is no longer
+  reachable in practice. Reports say `NOT ASSESSED` (no scan recorded) or `NO VIOLATIONS FOUND IN
+  CHECKED GUIDELINES (N unchecked)`, and guidelines no analyzer checked are `Not checked`. Scripts
+  that match the old strings need updating. After upgrading, run one scan to record a baseline.
+- **MCP approvals become proposals.** `compliance_approve_finding`, `compliance_add_deviation`,
+  `compliance_recategorize` and `compliance_suppress_finding` no longer take effect until a person
+  runs `maishac proposals accept`. `MAISHAC_ALLOW_AGENT_APPROVALS=1` restores the old behaviour (unsafe).
+- **`test_command` removed from the MCP `compliance_begin_session`.** Configure it with
+  `--test-command`, `MAISHAC_TEST_COMMAND` or `.maishac/config.json`; it runs without a shell and the
+  default timeout is 600 s (was 1800 s).
+- **CLI errors exit 1** with `error: ...` on stderr instead of a traceback. A scan that finds no
+  files is an error, not `converged`.
+- **Scan exit codes:** `scan` still exits 0 unless `--fail-on` (or `gate`) is given. With it, exit 1
+  means findings and exit 2 means a degraded analysis (missing/failed analyzer) unless `--allow-degraded`.
+  A pipeline that previously relied on `gate` semantics must pass `--allow-degraded` to keep passing
+  without cppcheck/clang-tidy installed.
+- **Import gating is the default.** Re-importing a newer SARIF file from the same tool resolves the
+  findings that are gone from it, into `pending_verification` (so a person still confirms with
+  `maishac approve`). Findings from other tools are untouched. `LoopEngine.import_sarif(gate=False)`
+  keeps the ungated behaviour for library users.
+- **`REGISTRY.resolve()` is exact.** `deviate "21"` or `deviate "misra"` now fail instead of binding to
+  a rule; `MISRA Dir 4.1` no longer resolves to Rule 4.1.
+- **`mcp` is an optional extra.** `pip install maishac` no longer installs it; use
+  `pip install 'maishac[mcp]'` (pinned `mcp>=1.2.0,<2`) for `maishac serve`.
+- **MCP path confinement:** paths outside the project root are rejected unless
+  `MAISHAC_ALLOW_OUTSIDE_PROJECT=1`.
+- **Memory schema is now v5** and migrates in place on first open. Downgrading afterwards is not supported.
+- **MCP scans are always gated.** An MCP-originated `compliance_scan`, `compliance_import_sarif` or
+  session `verify` sends findings the analyzer no longer reports to `pending_verification`, never
+  straight to `resolved`. `compliance_begin_session(verification_policy="analyzer_only")` is rejected
+  over MCP. `MAISHAC_ALLOW_AGENT_APPROVALS=1` lifts both (unsafe). The CLI is unchanged, except that
+  a session with the `analyzer_only` policy now holds blocker/critical and semantic-risk findings
+  for human approval.
+- **Waivers recorded before provenance tracking show as `legacy`**, not `cli`. Suppressions,
+  deviations, re-categorizations and approvals from a pre-v3 database could have been written by an
+  MCP agent, so reports flag them "origin unknown". Review them, and re-record or revoke the ones
+  you do not stand behind.
+- **Windows databases are rewritten once.** Rows stored with backslash paths get forward-slash paths
+  and the fingerprints Maisha now computes (suppressions and fix attempts follow; each rewrite is in
+  the audit log). Fingerprints imported from other tools keep their value and only the path changes.
+- **`MemoryStore.add_deviation` / `add_recategorization` raise `ValueError`** for a rule id the
+  registry cannot resolve, and `suppress` for an ambiguous one, instead of treating it as non-Mandatory.
+
+### Security
+- **An MCP agent can no longer resolve findings by rescanning.** `LoopEngine.scan` and
+  `import_sarif` force the verification gate when the engine was created for MCP, so editing code and
+  calling `compliance_scan` no longer produces `resolved`/`analyzer` rows for blocker or
+  semantic-risk findings. A finding in a file that disappeared from its path (moved, renamed,
+  moved into an excluded directory) goes to `pending_verification` when it is high-severity,
+  semantic-risk or the scan is gated, instead of `resolved`/`file_removed`.
+- **An MCP agent can no longer approve its own work.** `compliance_approve_finding`,
+  `compliance_add_deviation`, `compliance_recategorize` and
+  `compliance_suppress_finding` now create *proposals* (`pending_human`) that a
+  person finalizes with `maishac proposals accept <id> --by <name>` (or the direct
+  CLI commands). `MAISHAC_ALLOW_AGENT_APPROVALS=1` restores the old direct
+  behaviour; it is documented as unsafe, recorded with `source=mcp` and flagged in
+  reports. Suppressions in a SARIF file are not carried over by an agent-started import.
+- **`test_command` is human-only.** It is no longer an argument of
+  `compliance_begin_session`; set it with `--test-command`, `MAISHAC_TEST_COMMAND`
+  or `.maishac/config.json`. It runs without a shell (shlex argv), with a 600 s
+  default timeout (was 1800 s) and the whole process group is killed on timeout.
+- **MISRA Mandatory guidelines can not be suppressed**, including through a SARIF
+  import, and deviation/suppression checks use the category after GRP
+  re-categorization. Existing suppressions/permits on Mandatory rules are ignored at
+  the next scan.
+
+### Added
+- **Honest analysis outcomes.** Every analyzer returns an explicit per-run result
+  (`Analyzer.run()` -> `AnalysisResult`; `analyze()` stays as a findings-only wrapper). A crashed,
+  timed-out or missing analyzer no longer makes its findings look fixed: `sync_scan` only closes
+  findings in files an analyzer actually analyzed. Scan/verify return `analyzer_errors`,
+  `analysis_complete` and `coverage_warning`; the CLI prints them on stderr. New non-terminal session state
+  `analysis_incomplete` (becomes `budget_exhausted` when the budget is spent). cppcheck without its MISRA
+  addon is a partial run that claims no file.
+- **`scans` table** recording what each scan, verify and import ran (paths, files, analyzers used and
+  failed, tool versions, degraded flag, Maisha version). Every report shows a "last scan" block. Import
+  rows are provenance only.
+- **`Not checked` status and honest verdicts** in `misra_compliance_summary`, the compliance matrix
+  (`rules_in_kb`, `rules_detectable`, `clean_among_checked`, `analysis_recorded`, `analysis_degraded`) and the
+  Guideline Enforcement Plan (`checked_by` lists only mapped analyzers, `(not installed)` when absent;
+  reference-only guidelines read "Not enforced by tooling - requires separate method"). Expired deviation
+  permits no longer count.
+- **Scan options:** `--exclude` / `--no-default-excludes` (default excludes: `.git`, `.maishac`, `build`,
+  `dist`, `node_modules`, `.venv`, ...), `--std`, `--compiler-flag` (closed allowlist, because MCP agents can set
+  it), `--compile-commands`; MCP `exclude`. The compiler adapter runs in a small thread pool.
+- **Packaging and CI:** CI matrix (Python 3.10-3.12 on Linux; Windows and macOS as experimental
+  non-blocking entries), ruff job, a run without the `mcp` extra, and a `build` + `twine check` job that
+  verifies the wheel ships `maishac/rules/*.json` (`tools/check_dist.py`). `release.yml` and
+  `docker-publish.yml` run the tests first and refuse a tag that differs from `v{__version__}`. Third-party
+  actions are pinned to commit SHAs. The Docker image installs gcc and the `[mcp]` extra and runs as a non-root user (uid
+  1000; see the Dockerfile for volume permissions).
+- `pyproject.toml` has a minimal `[tool.ruff]` baseline (pyflakes + core pycodestyle errors).
+- **CI gate.** `maishac scan --fail-on <blocker|critical|major|minor|info|any|none>` (and
+  the alias `maishac gate`, default `any`) exits 1 when open findings are at or above the
+  threshold, and 2 when the analysis was degraded (an analyzer failed, or a recommended
+  one is not installed) unless `--allow-degraded`. Findings take precedence over
+  degradation. Without `--fail-on`, `scan` still exits 0. The scan JSON gains
+  `open_by_severity` and, with the flag, a `gate` block.
+- `MemoryStore.close()` / context manager and `LoopEngine.close()`; the CLI closes its
+  connections. `maishac --project` must be an existing directory.
+- `session abort <id>` / `compliance_abort_session` / `LoopEngine.abort_session`
+  end a session on purpose (audit-logged `session_end`, undecided fix attempts marked
+  `abandoned`). `session begin --severity-floor`. Sessions can end as `needs_human`
+  when every remaining finding is frozen by the oscillation guard.
+- Re-importing a newer SARIF file from the same tool resolves the imported findings
+  that are gone from it (to `pending_verification` by default, so a person still
+  confirms with `approve`), limited to that tool and the files its run covers.
+- Findings in files that were deleted are closed as stale (`resolved`, unless high-severity or semantic-risk: those wait in `pending_verification`; verification
+  method `file_removed`; `stale` in the scan diff). Schema v4 adds
+  `sessions.ended` / `sessions.end_reason` (migrates in place).
+- Append-only `audit_log` (every approval, suppression, deviation,
+  re-categorization, revocation, proposal decision, session start/end), `maishac audit`,
+  and an audit section in the markdown report. Entries from agents are marked.
+- `maishac unsuppress`, `revoke-deviation`, `uncategorize`; suppressions gain
+  approver, source and optional expiry (`--approver`, `--expires`, `--expires-days`).
+- Schema v3 (migrates in place): `source` on suppressions/deviations/
+  recategorizations, `approval_source` on findings, `proposals` and `audit_log` tables.
+
+### Fixed
+- `verify` and `abort` write the session status as a compare-and-set: a slow `verify` can no longer
+  overwrite a session aborted (or verified) meanwhile; it returns an error and records nothing.
+- `begin_session` is blocked by a session in `awaiting_verification` or `analysis_incomplete`, not only
+  `active` (`force` still overrides).
+- Identical violating lines are numbered by line across analyzers before merging, so a tool that
+  reports only the second of two identical lines no longer merges into the first line's finding.
+  Known limit: identity of repeats is positional, so fixing the first of two identical lines makes
+  the survivor take the first line's fingerprint (and any suppression/approval attached to it).
+  Re-check such waivers after editing one of several identical lines.
+- **A failing analyzer no longer reads as a fix** (see Added: honest analysis outcomes), and plumbing
+  bugs behind it: a shared `_line_of` source cache, cppcheck `misra-c2012-dir-N` ids now map to
+  `MISRA-C:2012 Dir N`, cppcheck gets `--file-list` instead of a huge argv, and clang-tidy runs once per file with
+  `--header-filter=^$` (header diagnostics are never reported; headers are `skipped_files`).
+- **SARIF export:** uses the real Maisha version (was hard-coded), exports suppressed/deviated findings with
+  `suppressions`, includes the persisted `column`, and keeps pending findings out of the results.
+- **Single-sourced version.** `__version__` in `maishac/__init__.py` is the only place; `pyproject.toml` reads it
+  dynamically. `CITATION.cff` (was 0.3.2), the README badge and the INSTALL sample output are
+  aligned and covered by `tests/test_version_consistency.py`. `VALIDATION.md` carries a historical note.
+- **Native banned-call false positives.** Member access (`obj->free(x)`, `ops.system()`),
+  declarations/definitions of a banned name (`char *strcpy(char *, const char *);`) and
+  the macro being defined (`#define free(p) ...`) no longer count as calls to the library
+  function. Real calls (`return free(p)`, `else exit(1)`) are still reported.
+- **Native Rule 15.6 header parsing.** Control-statement headers are matched with balanced
+  parentheses, so a `do { } while (f(a) && g(b));` tail on its own line is no longer
+  reported as a braceless body, and `if (g(a)) { a++;` is not treated as braceless. An
+  empty body (`while (x);`, `for (;;);`) is reported as 15.6 (`;` is not a compound statement).
+- The CLI reports expected errors (unknown session id, invalid argument) as `error: ...`
+  with exit 1 instead of a traceback; `scan --analyzers` tolerates spaces.
+- `search_notes` / `memory_search` treat `%` and `_` literally instead of as LIKE wildcards.
+- Performance: `sync_scan` loads suppressions, deviations and re-categorizations once per
+  scan instead of querying per finding, and `verify` closes pending fix attempts with a
+  single UPDATE. Behaviour is unchanged.
+- **Finding lifecycle:** a `regressed` finding that is still present stays `regressed`;
+  a `pending_verification` finding that comes back counts as a regression (so the
+  oscillation freeze works under gated policies) and marks its fix attempts
+  `regressed`. Attempts of a session that ends unresolved become `abandoned`.
+- **Sessions:** verify respects the session's severity floor and paths (findings
+  outside are reported as `open_out_of_scope`, imported ones as `open_imported`; neither
+  blocks convergence). A scan that finds zero files is an error, never `converged`.
+  Settings are validated (analyzer names, policy, floor, positive integers). Ended
+  sessions refuse `next_batch`/`verify`/`record_attempt`. `begin_session` checks for an
+  active session and creates one in a single transaction. Stall detection compares the
+  open count at the start of the window with now.
+- **SARIF import:** the file path is resolved against the project root (then the current
+  directory); `file` URIs (`file://`, percent-encoding, backslashes, absolute paths
+  inside the project) normalize to one project-relative POSIX path, used for both
+  `file` and the fingerprint.
+- **Fingerprints** use forward slashes on every OS. Identical violating lines in one
+  function are separate findings (occurrence index; occurrence 0 hashes exactly as
+  before, so existing fingerprints stay valid).
+
+### Changed
+- The MISRA C:2012 guideline total shown in reports is the documented, approximate constant
+  `MISRA_C_2012_APPROX_GUIDELINES` (roughly 175) and README/COVERAGE.md say "roughly 175" instead of
+  "180+" (the two disagreed).
+- Documentation pass: README (scope, CI exit codes, report statuses, session states, audit log, upgrade notes),
+  INSTALL, CLAUDE.md, CONTRIBUTING, AGENT_PLAYBOOK, AUTHORING_PLAYBOOK and integrations/.
+  `.maishac/config.json` is documented as human-controlled only if the agent cannot write to the project dir.
+- `coverage.native_ids()` reads an explicit `NATIVE_RULES` registry in `maishac/analyzers/native.py`
+  instead of regex-scanning the analyzer's source. The analyzer raises if a check reports a rule
+  that is not registered, and a test compares the registry with the queries in the source.
+  `COVERAGE.md` is unchanged.
+- Native analyzer: removed dead Rule 15.2 bookkeeping (no-op `_resolve_gotos`, unused goto/label
+  tables and regexes) and stale comments; detections unchanged. Rule 15.2 stays documented as
+  not implemented natively.
+- **MCP server:** tool bodies run on a worker thread (serialized by a lock) so a long scan
+  no longer blocks the event loop. Path arguments (`paths`, `include_paths`, `exclude`,
+  `compile_commands`, `-I` flags, SARIF `path`) must stay inside the project root unless
+  the server is started with `MAISHAC_ALLOW_OUTSIDE_PROJECT=1`.
+- `REGISTRY.resolve` is exact: no more substring fallback, so `deviate "misra"` or
+  `deviate "21"` fail with a helpful message instead of binding to some rule;
+  `MISRA Dir 4.1` no longer resolves to Rule 4.1, and a bare number matching both a
+  Rule and a Directive is rejected as ambiguous. Use `REGISTRY.search()` for fuzzy lookup.
+- The CLI `suppress`/`deviate` apply the same validation as the MCP tools (reason/
+  justification length, fingerprint must exist, no negative or past expiry);
+  `--expires YYYY-MM-DD` now means the end of that day.
+- Replacing a suppression no longer loses the earlier reason; it is kept in the audit log.
+
 ## [0.4.0] - 2026-07-19
 
 ### Changed

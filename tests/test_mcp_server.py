@@ -130,8 +130,11 @@ def test_mcp_tools_in_process(tmp_path, monkeypatch):
     # deviation guards: unknown rule + too-short justification
     assert "error" in json.loads(m.compliance_add_deviation("nope", "*", "x" * 20))
     assert "error" in json.loads(m.compliance_add_deviation("MISRA 21.3", "src/*", "short"))
-    assert "deviation_id" in json.loads(
+    # ...and a valid one is only a PROPOSAL: the agent cannot self-approve
+    dev = json.loads(
         m.compliance_add_deviation("MISRA 21.3", "src/*", "heap_4 allocator approved here"))
+    assert dev["status"] == "pending_human" and "deviation_id" not in dev
+    assert m._engine().mem.deviations() == []
 
     # GRP legality enforced through the tool
     assert "error" in json.loads(m.compliance_recategorize("MISRA 21.3", "advisory", "why"))
@@ -139,7 +142,10 @@ def test_mcp_tools_in_process(tmp_path, monkeypatch):
     # suppress guards + success
     assert "error" in json.loads(m.compliance_suppress_finding("deadbeef", "reason enough here"))
     assert "error" in json.loads(m.compliance_suppress_finding(fp, "short"))
-    assert json.loads(m.compliance_suppress_finding(fp, "false positive: macro noise"))["suppressed"]
+    sup = json.loads(m.compliance_suppress_finding(fp, "false positive: macro noise"))
+    assert sup["status"] == "pending_human" and "suppressed" not in sup
+    assert not m._engine().mem.is_suppressed(fp)
+    assert len(json.loads(m.compliance_list_proposals())) == 2
 
     assert "note_id" in json.loads(m.memory_note("uses pool_alloc", topic="alloc"))
     assert isinstance(json.loads(m.memory_search("pool")), list)
@@ -149,8 +155,11 @@ def test_mcp_tools_in_process(tmp_path, monkeypatch):
         assert m.compliance_report(fmt)
 
     # SARIF import through the tool
-    imp = json.loads(m.compliance_import_sarif(
-        str(REPO / "benchmark" / "synthetic_qualified_engine.sarif.json")))
+    # (paths outside the project root are refused, so the file is copied in)
+    sarif_in = proj / "qualified.sarif.json"
+    sarif_in.write_text(
+        (REPO / "benchmark" / "synthetic_qualified_engine.sarif.json").read_text("utf-8"))
+    imp = json.loads(m.compliance_import_sarif(str(sarif_in)))
     assert imp["imported"] >= 1
 
 

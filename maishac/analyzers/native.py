@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .base import Analyzer
+from .base import AnalysisResult, Analyzer
 from ..model import Finding, enclosing_function, relpath
 from ..rules import REGISTRY
 
@@ -96,11 +96,55 @@ BANNED_CALLS = {
     "vsprintf": ("CERT STR31-C", "unbounded format"),
 }
 
+# Every rule query the native analyzer can emit. This is the registry that
+# maishac.coverage reads to decide which rules are "detected" (COVERAGE.md, the
+# enforced/reference split), so it must be edited together with any check that
+# is added or removed. Findings are only ever created through `_mk`, which
+# rejects a query missing from this set, and tests/test_native_quality.py checks
+# the set against the queries written in this file in both directions.
+NATIVE_RULES = frozenset({
+    # MISRA C:2012 directives
+    "MISRA Dir 4.4", "MISRA Dir 4.6",
+    # MISRA C:2012 rules
+    "MISRA 4.2", "MISRA 7.1", "MISRA 7.3", "MISRA 12.5", "MISRA 13.4",
+    "MISRA 13.6", "MISRA 15.1", "MISRA 15.6", "MISRA 16.2", "MISRA 16.4",
+    "MISRA 16.5", "MISRA 16.6", "MISRA 17.2", "MISRA 17.6", "MISRA 18.8",
+    "MISRA 19.2", "MISRA 20.2", "MISRA 20.3", "MISRA 20.5", "MISRA 20.10",
+    "MISRA 20.11", "MISRA 20.13", "MISRA 20.14", "MISRA 21.3", "MISRA 21.4",
+    "MISRA 21.5", "MISRA 21.6", "MISRA 21.8", "MISRA 21.9",
+    # CERT C
+    "CERT CON33-C", "CERT ENV33-C", "CERT ERR34-C", "CERT FLP37-C",
+    "CERT MSC32-C", "CERT MSC33-C", "CERT STR31-C",
+    # BARR-C:2018
+    "BARR 3.1a", "BARR 3.2a",
+})
+
 _CALL_RE = re.compile(r"\b(" + "|".join(BANNED_CALLS) + r")\s*\(")
+# Text before a banned name that shows it is NOT a call to the library function:
+#   * member access (`obj->free(x)`, `ops.system()`), a struct field that merely
+#     shares the name;
+#   * a declaration or definition (`void *signal(int);`): one or more
+#     type-ish words/stars from the start of the line, none of them a keyword
+#     that can precede a real call (`return free(p)`, `else exit(1)`);
+#   * the macro being defined (`#define free(p) my_free(p)`).
+_MEMBER_PREFIX_RE = re.compile(r"(?:\.|->)\s*$")
+_DECL_PREFIX_RE = re.compile(r"^\s*(?:[A-Za-z_]\w*[\s*]+)+$")
+_DEFINE_PREFIX_RE = re.compile(r"^\s*#\s*(?:define|undef)\s+$")
+_CALL_KEYWORDS = frozenset({"return", "else", "do", "case", "goto", "sizeof"})
+
+
+def _is_library_call(line: str, m: "re.Match[str]") -> bool:
+    """True when the banned-name match at `m` is a call, not a member or a declaration."""
+    prefix = line[:m.start()]
+    if _MEMBER_PREFIX_RE.search(prefix) or _DEFINE_PREFIX_RE.match(prefix):
+        return False
+    if _DECL_PREFIX_RE.match(prefix):
+        return bool(set(re.findall(r"[A-Za-z_]\w*", prefix)) & _CALL_KEYWORDS)
+    return True
 _OCTAL_RE = re.compile(r"(?<![\w.])0[0-7]+(?![\dxXbB.eEuUlL'])")
 _LSUFFIX_RE = re.compile(r"\b\d+[uU]?l\b")
 _ASSIGN_COND_RE = re.compile(r"\b(if|while)\s*\(([^()]|\([^()]*\))*[^=!<>+\-*/%&|^]=(?!=)")
-_NOBRACE_RE = re.compile(r"^\s*(if|else\s+if|for|while)\s*\(.*\)\s*[^{;\s].*;\s*$")
+_CTRL_OPEN_RE = re.compile(r"^\s*(if|else\s+if|for|while)\s*\(")
 _ELSE_NOBRACE_RE = re.compile(r"^\s*else\s+(?!if\b)(?!\{)[^{;\s].*;\s*$")
 _CTRL_HDR_RE = re.compile(r"^\s*(if|else\s+if|for|while)\s*\(.*\)\s*$")
 _ELSE_HDR_RE = re.compile(r"^\s*else\s*$")
@@ -110,7 +154,6 @@ _UNDEF_RE = re.compile(r"^\s*#\s*undef\b")
 _TRIGRAPH_RE = re.compile(r"\?\?[=/'()!<>\-]")
 _VLA_RE = re.compile(r"\b(?:int|char|float|double|long|short|uint\d+_t|int\d+_t|size_t)\s+\w+\s*\[\s*([a-zA-Z_]\w*)\s*\]")
 _MACRO_CONST_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-_FLOAT_EQ_RE = re.compile(r"\b(float|double)\b")
 _BASIC_TYPE_DECL_RE = re.compile(r"^\s*(?:static\s+|const\s+|volatile\s+|extern\s+)*(?:unsigned\s+|signed\s+)?(int|short|long)\b(?!\s*\()")
 _COMMENTED_CODE_RE = re.compile(r"(;|\{|\}|\breturn\b|=)")
 _PREPROC_RE = re.compile(r"^\s*#")
@@ -182,16 +225,6 @@ _DEFAULT_LABEL_RE = re.compile(r"\bdefault\s*:")
 # `case X:` -- the value may contain colons (a scope operator never does in C,
 # but a character constant like ':' does), so match the keyword, not the colon.
 _CASE_LABEL_RE = re.compile(r"\bcase\b[^;]*:")
-_GOTO_LABEL_RE = re.compile(r"\bgoto\s+(\w+)\s*;")
-# A label definition: an identifier alone before a colon at the start of a
-# statement. Excludes `case`/`default` (handled above) and anything that looks
-# like a ternary or a bit-field width.
-_LABEL_DEF_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*:(?!:)(?!\s*[0-9])\s*$")
-# Strips a leading `case X:` / `default:` so a one-line clause is judged on its
-# statement rather than its label.
-_LABEL_PREFIX_RE = re.compile(r"^\s*(?:case\b[^;]*?|default\s*):")
-# What may legitimately end a switch clause (Rule 16.3).
-_CLAUSE_TERMINATOR_RE = re.compile(r"\b(break|return|goto|continue)\b")
 
 
 def _logical_preproc(lines: list[str]) -> list[tuple[int, str]]:
@@ -333,6 +366,67 @@ def _next_significant(lines: list[str], start_idx: int) -> str | None:
     return lines[j] if j < len(lines) else None
 
 
+def _is_do_while_tail(lines: list[str], idx: int) -> bool:
+    """True when line `idx` (0-based) is `while (cond);` closing a `do { } while`.
+
+    Such a line is a loop terminator, not a loop with an empty body. It is told
+    apart by walking back from the `}` that precedes it to the matching `{` and
+    checking that a `do` sits in front of that brace.
+    """
+    depth = 0
+    j = idx - 1
+    while j >= 0 and not lines[j].strip():
+        j -= 1
+    if j < 0 or not lines[j].rstrip().endswith("}"):
+        return False
+    for k in range(j, -1, -1):
+        text = lines[k]
+        for c in reversed(text):
+            if c == "}":
+                depth += 1
+            elif c == "{":
+                depth -= 1
+                if depth == 0:
+                    before = text[:text.rfind("{")].rstrip()
+                    m = k
+                    while not before and m > 0:   # brace on its own line
+                        m -= 1
+                        before = lines[m].rstrip()
+                    return re.search(r"(?:^|[^\w])do$", before) is not None
+    return False
+
+
+def _braceless_body(lines: list[str], idx: int) -> bool:
+    """Rule 15.6: does line `idx` (0-based) hold a control header whose body
+    is a single non-compound statement on the same line?
+
+    The header's closing parenthesis is found by balanced matching. A greedy
+    regex backtracked onto an inner `)`, so `while (f(a) && g(b));` was read as
+    a header ending at `f(a)` with a body of `) && g(b)`. An empty body
+    (`while (x);`, `for (;;);`) is a violation too: `;` is not a compound
+    statement, and MISRA's compliant form is `while (x) { }`. The exception is
+    the `while (x);` that terminates a `do { } while`.
+    """
+    line = lines[idx]
+    m = _CTRL_OPEN_RE.match(line)
+    if not m:
+        return False
+    depth = 0
+    for pos in range(m.end() - 1, len(line)):
+        if line[pos] == "(":
+            depth += 1
+        elif line[pos] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+    else:
+        return False          # header continues on a later line
+    body = line[pos + 1:].strip()
+    if body == ";":
+        return not (m.group(1) == "while" and _is_do_while_tail(lines, idx))
+    return bool(body) and body[0] not in "{;" and body.endswith(";")
+
+
 class NativeAnalyzer(Analyzer):
     name = "native"
     requires = None
@@ -342,17 +436,24 @@ class NativeAnalyzer(Analyzer):
         from .. import __version__
         return f"maishac {__version__}"
 
-    def analyze(self, files: list[Path], root: Path,
-                include_paths: list[str] | None = None) -> list[Finding]:
+    def run(self, files: list[Path], root: Path,
+            include_paths: list[str] | None = None,
+            options: dict | None = None) -> AnalysisResult:
         # lexical checks need no compilation model, so include paths don't apply here
-        findings: list[Finding] = []
+        res = AnalysisResult(self.name)
         for f in files:
+            rel = relpath(f, root)
             try:
                 src = f.read_text("utf-8", errors="replace")
-            except OSError:
+                res.findings.extend(self._analyze_file(f, src, root))
+            except Exception as e:  # noqa: BLE001 — a file we could not analyze must not look clean
+                res.failed_files.append(rel)
+                res.error = res.error or f"{rel}: {type(e).__name__}: {e}"
                 continue
-            findings.extend(self._analyze_file(f, src, root))
-        return findings
+            res.analyzed_files.append(rel)
+        if res.failed_files:
+            res.status = "partial" if res.analyzed_files else "failed"
+        return res
 
     def analyze_source(self, code: str, filename: str, root: Path) -> list[Finding]:
         """Analyze an in-memory source string (never touches disk) — the entry
@@ -362,6 +463,8 @@ class NativeAnalyzer(Analyzer):
     # ---------------------------------------------------------------- helpers
     def _mk(self, rule_query: str, f: Path, root: Path, lineno: int,
             lines: list[str], msg: str) -> Finding | None:
+        if rule_query not in NATIVE_RULES:
+            raise ValueError(f"native check reports {rule_query!r}, which is not in NATIVE_RULES")
         meta = REGISTRY.resolve(rule_query)
         if not meta:
             return None
@@ -375,29 +478,7 @@ class NativeAnalyzer(Analyzer):
         )
 
     @staticmethod
-    def _resolve_gotos(fn: dict, add) -> None:
-        """Rule 15.2 (a goto must jump forward) is deliberately NOT implemented.
-
-        Labels are function-scoped in C, so the rule is only decidable with
-        reliable function boundaries -- and _FUNC_DEF_RE needs the whole
-        signature on one line, which mbedtls and lwip routinely split across
-        three. Without a frame the check silently does not run; with the wrong
-        frame it resolves `goto out;` against an `out:` in a different function.
-        Both failure modes appeared on the benchmark corpus: 423 findings, then
-        284 after scoping labels per function, then 192 after dropping the
-        file-global fallback -- all of them wrong, and the residue coming from
-        functions whose frames merged.
-
-        Worse, the surviving check was invisible: on a fixture whose functions
-        all had multi-line signatures it reported zero, which reads identically
-        to correct. cppcheck implements 15.2 with a real parser; the KB carries
-        the rule for that path and for deviation records.
-        """
-        return
-
-    @staticmethod
-    def _close_switch(sw: dict, add, clean_lines: list[str] | None = None,
-                      end_line: int | None = None) -> None:
+    def _close_switch(sw: dict, add) -> None:
         """Checks that can only be decided once a switch's whole body is seen."""
         if not sw["saw_default"]:
             add("MISRA 16.4", sw["start"], "switch statement has no default label")
@@ -586,18 +667,12 @@ class NativeAnalyzer(Analyzer):
         # it has.
         switch_stack: list[dict] = []
         depth = 0
-        # Rule 15.2 state. Labels are function-scoped in C, and treating them as
-        # file-global is catastrophic here: mbedtls uses `goto cleanup;` in
-        # hundreds of functions, so a file-global lookup resolves every one of
-        # them to the FIRST `cleanup:` in the file and calls the rest backward
-        # jumps -- 423 findings in mbedtls alone, all wrong. Resolution happens
-        # when a function closes, so a label defined later in the same function
-        # still counts as a forward jump.
-
         for i, line in enumerate(clean_lines, start=1):
             raw = raw_lines[i - 1] if i <= len(raw_lines) else ""
 
             for m in _CALL_RE.finditer(line):
+                if not _is_library_call(line, m):
+                    continue
                 fn = m.group(1)
                 rule, why = BANNED_CALLS[fn]
                 add(rule, i, f"call to banned function '{fn}' ({why})")
@@ -607,7 +682,7 @@ class NativeAnalyzer(Analyzer):
                 add("MISRA 7.3", i, "lowercase 'l' literal suffix is easily misread as '1'")
             if _ASSIGN_COND_RE.search(line):
                 add("MISRA 13.4", i, "assignment used inside a condition expression")
-            if _NOBRACE_RE.match(line) or _ELSE_NOBRACE_RE.match(line):
+            if _braceless_body(clean_lines, i - 1) or _ELSE_NOBRACE_RE.match(line):
                 add("MISRA 15.6", i, "control statement body is not a compound (braced) block")
             # header on one line, braceless body on the next — skip over any
             # #if/#else/#endif between the header and its real body first.
@@ -617,20 +692,18 @@ class NativeAnalyzer(Analyzer):
                         and not _CTRL_HDR_RE.match(nxt) and not _ELSE_HDR_RE.match(nxt):
                     add("MISRA 15.6", i,
                         "control statement body is not a compound (braced) block")
+            # Rule 15.2 (a goto must jump forward) is deliberately NOT
+            # implemented. Labels are function-scoped in C, so the rule is only
+            # decidable with reliable function boundaries. Resolving labels
+            # against a file-global table, or against a function frame that
+            # merged with a neighbour, produced hundreds of wrong findings on
+            # mbedtls (`goto cleanup;` resolved to another function's
+            # `cleanup:`), and with no frame the check silently reported nothing,
+            # which reads the same as correct. cppcheck implements 15.2 with a
+            # real parser; the KB carries the rule for that path and for
+            # deviation records.
             if _GOTO_RE.search(line):
                 add("MISRA 15.1", i, "goto statement")
-            # Only inside a *recognised* function. _FUNC_DEF_RE needs the whole
-            # signature on one line, and mbedtls declares plenty across several
-            # lines -- falling back to a file-global label table there resolved
-            # `goto out;` against an `out:` belonging to a different function
-            # entirely (284 findings in mbedtls, all wrong). Missing a real
-            # backward goto in an unrecognised function is the acceptable
-            # trade: a false negative costs less than a false positive here.
-            if func_stack:
-                if (gm := _GOTO_LABEL_RE.search(line)):
-                    func_stack[-1]["gotos"].append((i, gm.group(1)))
-                if (lm := _LABEL_DEF_RE.match(line)) and lm.group(1) != "default":
-                    func_stack[-1]["labels"].setdefault(lm.group(1), i)
             if _UNION_RE.search(line):
                 add("MISRA 19.2", i, "union declaration")
             if _UNDEF_RE.match(line):
@@ -699,7 +772,6 @@ class NativeAnalyzer(Analyzer):
                     # Read parameters off the JOINED signature, so an array
                     # parameter declared on a wrapped line is still seen.
                     "array_params": _array_param_names(fdef["sig"]),
-                    "gotos": [], "labels": {},
                 }
 
             # float equality: crude but effective — == or != on a line mentioning float vars is
@@ -722,7 +794,7 @@ class NativeAnalyzer(Analyzer):
                 func_stack.append(pending_func)
                 pending_func = None
             while func_stack and func_stack[-1]["depth"] > depth:
-                self._resolve_gotos(func_stack.pop(), add)
+                func_stack.pop()
             if _SWITCH_RE.search(line):
                 switch_stack.append({"start": i, "depth": depth, "saw_default": False,
                                      "cases": 0, "labels": [], "body_depth": None})
@@ -755,13 +827,10 @@ class NativeAnalyzer(Analyzer):
                             "case/default label is nested inside an inner block "
                             "rather than the switch's own compound statement")
             while switch_stack and depth < switch_stack[-1]["depth"]:
-                self._close_switch(switch_stack.pop(), add, clean_lines, i)
+                self._close_switch(switch_stack.pop(), add)
 
         for sw in switch_stack:  # unterminated at EOF
-            self._close_switch(sw, add, clean_lines, len(clean_lines) + 1)
-
-        for fn in func_stack:   # functions still open at EOF
-            self._resolve_gotos(fn, add)
+            self._close_switch(sw, add)
 
         self._preprocessor_checks(raw_lines, clean_lines, add)
 

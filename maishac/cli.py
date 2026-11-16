@@ -2,6 +2,8 @@
 
     maishac doctor                        diagnose install, toolchain and coverage
     maishac scan src/                     scan + sync memory
+    maishac scan src/ --fail-on major     CI gate: exit 1 on findings, 2 if degraded
+    maishac gate src/                     same as scan --fail-on any
     maishac guide "dynamic memory"        author-time: the compliant idiom to reach for
     maishac check draft.c                 lint a draft in memory (no store); '-' = stdin
     maishac findings --limit 20           list open findings
@@ -9,6 +11,7 @@
     maishac session begin src/            start an engineered fix session
     maishac session batch <id>            next prioritized batch (JSON)
     maishac session verify <id>           rescan + converge check
+    maishac session abort <id>            end a session (audit-logged)
     maishac deviate "MISRA 21.6" -s "src/debug/*" -j "..."
     maishac suppress <fingerprint> -r "false positive because ..."
     maishac note "Use pool_alloc() instead of malloc" -t allocator
@@ -16,6 +19,9 @@
     maishac report [--format markdown|json|sarif|misra-compliance|gep|grp] [-o file]
     maishac import findings.sarif         ingest an external engine's SARIF
     maishac approve <fingerprint> --by me  human sign-off on a verified fix
+    maishac unsuppress <fingerprint> | revoke-deviation <id> | uncategorize "MISRA 15.5"
+    maishac proposals list|accept <id> --by me|reject <id> --by me   agent-proposed sign-offs
+    maishac audit [--limit N] [--json]    append-only history of every sign-off
     maishac serve                         run the MCP server (stdio)
 """
 
@@ -29,14 +35,19 @@ import time
 from pathlib import Path
 
 from . import __version__
-from .engine import LoopEngine
-from .memory import MandatoryRuleError
+from .engine import FAIL_ON_CHOICES, LoopEngine, gate_verdict
 from .rules import REGISTRY
 from . import report as report_mod
 
 
+# Engines opened by the running command; main() closes them when it finishes.
+_OPEN_ENGINES: list[LoopEngine] = []
+
+
 def _engine(args) -> LoopEngine:
-    return LoopEngine(getattr(args, "project", None) or os.getcwd())
+    eng = LoopEngine(getattr(args, "project", None) or os.getcwd())
+    _OPEN_ENGINES.append(eng)
+    return eng
 
 
 def _print(obj) -> None:
@@ -53,14 +64,74 @@ def _warn_coverage(result: dict) -> None:
     warning = result.get("coverage_warning")
     if warning:
         print(f"\nWARNING: {warning}\n", file=sys.stderr)
+    elif result.get("analyzer_errors"):
+        # verify()/scan results always carry coverage_warning when analyzers
+        # failed; this is the belt-and-braces path for any other caller.
+        for e in result["analyzer_errors"]:
+            print(f"\nWARNING: {e['analyzer']} {e['status']}: {e['error']}\n", file=sys.stderr)
+
+
+def _scan_options(args) -> dict:
+    """Shared scan-option flags -> engine keyword arguments."""
+    return {"include_paths": args.include,
+            "exclude": args.exclude,
+            "default_excludes": not args.no_default_excludes,
+            "std": args.std,
+            "compiler_flags": args.compiler_flag,
+            "compile_commands": args.compile_commands}
+
+
+def _add_gate_options(s, default_fail_on: str | None) -> None:
+    s.add_argument("--fail-on", choices=FAIL_ON_CHOICES, default=default_fail_on,
+                   metavar="SEVERITY",
+                   help="CI gate. Exit 1 if an open finding is at or above SEVERITY "
+                        "(blocker|critical|major|minor|info; 'any' = every open finding; "
+                        "'none' = never fail on findings). Exit 2 if no findings fail but the "
+                        "analysis was degraded (an analyzer failed, or a recommended one is "
+                        "not installed) unless --allow-degraded. Findings take precedence "
+                        "over degradation. Without this flag scan always exits 0."
+                        + (" Default for 'gate': any." if default_fail_on else ""))
+    s.add_argument("--allow-degraded", action="store_true",
+                   help="With --fail-on: do not exit 2 for a degraded analysis.")
+
+
+def _add_scan_options(s) -> None:
+    s.add_argument("--include", "-I", action="append",
+                   help="Include dir forwarded to cppcheck/clang-tidy/the compiler as -I "
+                        "(repeatable). Without these, headers outside the "
+                        "scanned paths cause misconfiguration false positives.")
+    s.add_argument("--exclude", action="append",
+                   help="fnmatch pattern of directories/files to skip when walking a "
+                        "directory (repeatable), e.g. third_party or 'gen/*'. Added to "
+                        "the defaults (.git, .maishac, build, dist, node_modules, ...).")
+    s.add_argument("--no-default-excludes", action="store_true",
+                   help="Do not skip the default directories (.git, build, node_modules, ...).")
+    s.add_argument("--std", help="C standard for the compiler/clang-tidy checks (default c11).")
+    s.add_argument("--compiler-flag", action="append", metavar="FLAG",
+                   help="Extra compiler flag, e.g. -DNDEBUG or -Iinc (repeatable; only "
+                        "-D/-U/-I/-isystem/-iquote/-std= and a few target flags are accepted).")
+    s.add_argument("--compile-commands", metavar="FILE",
+                   help="compile_commands.json to take per-file -D/-I/-std flags from.")
 
 
 def cmd_scan(args):
     eng = _engine(args)
-    result = eng.scan(args.paths, args.analyzers.split(",") if args.analyzers else None,
-                      include_paths=args.include)
+    analyzers = ([a.strip() for a in args.analyzers.split(",") if a.strip()]
+                 if args.analyzers else None)
+    result = eng.scan(args.paths, analyzers, **_scan_options(args))
+    if "error" in result:
+        print(result["error"], file=sys.stderr)
+        sys.exit(1)
+    verdict = None
+    if args.fail_on:
+        verdict = gate_verdict(result, args.fail_on, args.allow_degraded)
+        result["gate"] = verdict
     _print(result)
     _warn_coverage(result)
+    if verdict:
+        print(f"gate: {verdict['reason']} (exit {verdict['exit_code']})", file=sys.stderr)
+        if verdict["exit_code"]:
+            sys.exit(verdict["exit_code"])
 
 
 def cmd_check(args):
@@ -85,13 +156,22 @@ def cmd_guide(args):
     _print(eng.guidance(args.topic, args.limit))
 
 
-def cmd_recategorize(args):
-    eng = _engine(args)
-    out = eng.recategorize(args.rule, args.to, args.rationale, args.approver)
+def _emit(out: dict) -> None:
+    """Print an engine result; an {"error": ...} result is a clean exit 1."""
     if "error" in out:
         print(out["error"], file=sys.stderr)
         sys.exit(1)
     _print(out)
+
+
+def cmd_recategorize(args):
+    eng = _engine(args)
+    _emit(eng.recategorize(args.rule, args.to, args.rationale, args.approver))
+
+
+def cmd_uncategorize(args):
+    eng = _engine(args)
+    _emit(eng.remove_recategorization(args.rule, args.by, args.reason))
 
 
 def cmd_findings(args):
@@ -129,17 +209,22 @@ def cmd_session(args):
         args.paths = paths or ["."]
         out = eng.begin_session(args.paths, {
             "max_iterations": args.max_iterations, "batch_size": args.batch_size,
+            "severity_floor": args.severity_floor,
             "verification_policy": args.verification_policy,
-            "test_command": args.test_command,
-            "include_paths": args.include}, force=args.force)
-        _print(out)
+            "test_command": args.test_command, "test_timeout": args.test_timeout,
+            **_scan_options(args)}, force=args.force)
+        _emit(out)
         _warn_coverage(out)
     elif args.action == "batch":
-        _print(eng.next_batch(args.session_id))
+        _emit(eng.next_batch(args.session_id))
     elif args.action == "verify":
-        _print(eng.verify(args.session_id))
+        out = eng.verify(args.session_id)
+        _emit(out)
+        _warn_coverage(out)
     elif args.action == "status":
         _print(eng.session_status(args.session_id))
+    elif args.action == "abort":
+        _emit(eng.abort_session(args.session_id, args.reason or "", args.by or ""))
 
 
 def cmd_approve(args):
@@ -167,24 +252,13 @@ def cmd_import(args):
 
 def cmd_deviate(args):
     eng = _engine(args)
-    meta = REGISTRY.resolve(args.rule)
-    if not meta:
-        print(f"Unknown rule '{args.rule}'", file=sys.stderr)
-        sys.exit(1)
-    expires_at = None
-    if args.expires:
-        try:
-            expires_at = time.mktime(time.strptime(args.expires, "%Y-%m-%d"))
-        except ValueError:
-            print(f"--expires must be YYYY-MM-DD (got '{args.expires}')", file=sys.stderr)
-            sys.exit(1)
-    try:
-        did = eng.mem.add_deviation(meta["id"], args.scope, args.justification,
-                                    args.approver, args.expires_days or None, expires_at)
-    except MandatoryRuleError as e:
-        print(str(e), file=sys.stderr)
-        sys.exit(1)
-    _print({"deviation_id": did, "rule_id": meta["id"]})
+    _emit(eng.deviate(args.rule, args.scope, args.justification, args.approver,
+                      args.expires_days or None, args.expires))
+
+
+def cmd_revoke_deviation(args):
+    eng = _engine(args)
+    _emit(eng.revoke_deviation(args.id, args.by, args.reason))
 
 
 def cmd_doctor(args):
@@ -201,8 +275,51 @@ def cmd_doctor(args):
 
 def cmd_suppress(args):
     eng = _engine(args)
-    eng.mem.suppress(args.fingerprint, args.reason)
-    _print({"suppressed": args.fingerprint})
+    _emit(eng.suppress(args.fingerprint, args.reason, args.approver,
+                       args.expires_days or None, args.expires))
+
+
+def cmd_unsuppress(args):
+    eng = _engine(args)
+    _emit(eng.unsuppress(args.fingerprint, args.by, args.reason))
+
+
+def cmd_proposals(args):
+    eng = _engine(args)
+    if args.action == "list":
+        status = None if args.all else "pending_human"
+        rows = eng.list_proposals(status)
+        if args.json:
+            _print(rows)
+        elif not rows:
+            print("No pending proposals." if status else "No proposals.")
+        else:
+            for r in rows:
+                print(f"{r['id']}  [{r['status']}] {r['kind']:<12} {r['summary']}")
+        return
+    if not args.id:
+        print(f"proposals {args.action} needs a proposal id.", file=sys.stderr)
+        sys.exit(1)
+    if args.action == "accept":
+        _emit(eng.accept_proposal(args.id, args.by or ""))
+    else:
+        _emit(eng.reject_proposal(args.id, args.by or "", args.reason or ""))
+
+
+def cmd_audit(args):
+    eng = _engine(args)
+    rows = eng.mem.audit_entries(args.limit, args.action)
+    if args.json:
+        _print(rows)
+        return
+    if not rows:
+        print("Audit log is empty.")
+        return
+    for r in rows:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["ts"]))
+        mark = "  [AGENT]" if r["source"] == "mcp" else ""
+        print(f"{ts}  {r['source']:<6} {r['action']:<24} {r['actor'] or '-':<18} "
+              f"{r['target']}{mark}")
 
 
 def cmd_note(args):
@@ -238,7 +355,8 @@ def cmd_serve(args):
     try:
         from .mcp_server import main as serve_main
     except ModuleNotFoundError as e:
-        sys.exit(f"The MCP server needs the 'mcp' package (missing: {e.name}). Install it with: pip install mcp")
+        sys.exit(f"The MCP server needs the optional 'mcp' package (missing: {e.name}). "
+                 "Install it with: pip install 'maishac[mcp]'")
     serve_main()
 
 
@@ -251,11 +369,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("scan", help="Scan paths and sync memory")
     s.add_argument("paths", nargs="+")
-    s.add_argument("--analyzers", help="Comma list: native,cppcheck,clang-tidy")
-    s.add_argument("--include", "-I", action="append",
-                   help="Include dir forwarded to cppcheck/clang-tidy as -I "
-                        "(repeatable). Without these, headers outside the "
-                        "scanned paths cause misconfiguration false positives.")
+    s.add_argument("--analyzers", help="Comma list: native,cppcheck,clang-tidy,compiler")
+    _add_scan_options(s)
+    _add_gate_options(s, None)
+    s.set_defaults(fn=cmd_scan)
+
+    s = sub.add_parser("gate", help="CI gate: scan, then exit 1 on open findings, 2 on a "
+                                    "degraded analysis (alias of 'scan --fail-on any')")
+    s.add_argument("paths", nargs="+")
+    s.add_argument("--analyzers", help="Comma list: native,cppcheck,clang-tidy,compiler")
+    _add_scan_options(s)
+    _add_gate_options(s, "any")
     s.set_defaults(fn=cmd_scan)
 
     s = sub.add_parser("findings", help="List open findings")
@@ -295,23 +419,30 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_rule)
 
     s = sub.add_parser("session", help="Engineered fix-loop sessions")
-    s.add_argument("action", choices=["begin", "batch", "verify", "status"])
+    s.add_argument("action", choices=["begin", "batch", "verify", "status", "abort"])
     s.add_argument("session_id", nargs="?")
     s.add_argument("paths", nargs="*")
     s.add_argument("--max-iterations", type=int, default=10)
     s.add_argument("--batch-size", type=int, default=5)
+    s.add_argument("--severity-floor", choices=["blocker", "critical", "major", "minor", "info"],
+                   default="minor",
+                   help="Ignore findings below this severity for convergence (default minor).")
+    s.add_argument("--reason", help="(abort) why the session is being ended.")
+    s.add_argument("--by", help="(abort) who is ending it, for the audit log.")
     s.add_argument("--verification-policy",
                    choices=["analyzer_only", "test_gated", "human_gated"],
                    help="How a fix is confirmed resolved (default: test_gated if "
                         "--test-command is set, else human_gated).")
     s.add_argument("--test-command",
-                   help="Shell command that must exit 0 to confirm fixes (e.g. 'make test').")
+                   help="Command that must exit 0 to confirm fixes (e.g. 'make test'). Split "
+                        "with shlex and run WITHOUT a shell; use \"sh -c '...'\" for pipes. "
+                        "Falls back to MAISHAC_TEST_COMMAND, then .maishac/config.json.")
+    s.add_argument("--test-timeout", type=float, metavar="SECONDS",
+                   help="Kill the test command (and its children) after this long "
+                        "(default 600; MAISHAC_TEST_TIMEOUT / config.json 'test_timeout').")
     s.add_argument("--force", action="store_true",
                    help="Start a new session even if one is already active on this project.")
-    s.add_argument("--include", "-I", action="append",
-                   help="Include dir forwarded to cppcheck/clang-tidy as -I "
-                        "(repeatable). Without these, headers outside the "
-                        "scanned paths cause misconfiguration false positives.")
+    _add_scan_options(s)
     s.set_defaults(fn=cmd_session)
 
     s = sub.add_parser("approve", help="Approve a pending_verification finding as resolved")
@@ -334,10 +465,47 @@ def build_parser() -> argparse.ArgumentParser:
                    help="permit lifetime in days from now (alternative to --expires)")
     s.set_defaults(fn=cmd_deviate)
 
+    s = sub.add_parser("revoke-deviation", help="Revoke a deviation permit (kept in the audit log)")
+    s.add_argument("id")
+    s.add_argument("--by", default="", help="who is revoking it")
+    s.add_argument("--reason", "-r", default="")
+    s.set_defaults(fn=cmd_revoke_deviation)
+
     s = sub.add_parser("suppress", help="Suppress a false positive")
     s.add_argument("fingerprint")
     s.add_argument("--reason", "-r", required=True)
+    s.add_argument("--approver", default="", help="who stands behind this suppression")
+    s.add_argument("--expires", help="suppression expiry as a date, YYYY-MM-DD (end of that day)")
+    s.add_argument("--expires-days", type=float, default=0)
     s.set_defaults(fn=cmd_suppress)
+
+    s = sub.add_parser("unsuppress", help="Remove a suppression (kept in the audit log)")
+    s.add_argument("fingerprint")
+    s.add_argument("--by", default="", help="who is removing it")
+    s.add_argument("--reason", "-r", default="")
+    s.set_defaults(fn=cmd_unsuppress)
+
+    s = sub.add_parser("uncategorize", help="Remove a GRP re-categorization (kept in the audit log)")
+    s.add_argument("rule")
+    s.add_argument("--by", default="")
+    s.add_argument("--reason", "-r", default="")
+    s.set_defaults(fn=cmd_uncategorize)
+
+    s = sub.add_parser("proposals", help="Review sign-offs an MCP agent proposed "
+                                         "(approve/deviate/suppress/recategorize)")
+    s.add_argument("action", choices=["list", "accept", "reject"])
+    s.add_argument("id", nargs="?")
+    s.add_argument("--by", help="the human accepting/rejecting (recorded as approver)")
+    s.add_argument("--reason", "-r", default="", help="note when rejecting")
+    s.add_argument("--all", action="store_true", help="list: include decided proposals")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_proposals)
+
+    s = sub.add_parser("audit", help="Show the append-only audit log of sign-offs and sessions")
+    s.add_argument("--limit", type=int, default=50)
+    s.add_argument("--action", help="only this action, e.g. suppress")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_audit)
 
     s = sub.add_parser("note", help="Persist project knowledge")
     s.add_argument("content")
@@ -371,7 +539,20 @@ def main(argv: list[str] | None = None) -> None:
             except Exception:  # noqa: BLE001 — never let output-hardening itself crash the CLI
                 pass
     args = build_parser().parse_args(argv)
-    args.fn(args)
+    project = getattr(args, "project", None)
+    if project and not Path(project).is_dir():
+        print(f"error: --project '{project}' is not an existing directory.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        args.fn(args)
+    except ValueError as e:
+        # Expected user errors (unknown session, invalid argument, refused
+        # sign-off) are a message and exit 1, never a traceback.
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        while _OPEN_ENGINES:
+            _OPEN_ENGINES.pop().close()
 
 
 if __name__ == "__main__":
