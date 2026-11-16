@@ -83,6 +83,12 @@ Read these before upgrading; each is also listed under Added/Changed/Fixed/Secur
   the next scan.
 
 ### Added
+
+- **Native MISRA C:2012 Rule 15.2** (goto must jump forward). Labels and gotos are scoped to the
+  function frame (multi-line signatures supported) and resolved when the function closes. On the
+  littlefs, lwip, mbedtls and zephyr corpora: 199 hits, 0 false positives (VALIDATION.md 4.1). The
+  enforced-rule total stays at 107 (cppcheck already covered it); rules reachable without cppcheck
+  go from 56 to 57.
 - **Honest analysis outcomes.** Every analyzer returns an explicit per-run result
   (`Analyzer.run()` -> `AnalysisResult`; `analyze()` stays as a findings-only wrapper). A crashed,
   timed-out or missing analyzer no longer makes its findings look fixed: `sync_scan` only closes
@@ -198,8 +204,7 @@ Read these before upgrading; each is also listed under Added/Changed/Fixed/Secur
   that is not registered, and a test compares the registry with the queries in the source.
   `COVERAGE.md` is unchanged.
 - Native analyzer: removed dead Rule 15.2 bookkeeping (no-op `_resolve_gotos`, unused goto/label
-  tables and regexes) and stale comments; detections unchanged. Rule 15.2 stays documented as
-  not implemented natively.
+  tables and regexes) and stale comments.
 - **MCP server:** tool bodies run on a worker thread (serialized by a lock) so a long scan
   no longer blocks the event loop. Path arguments (`paths`, `include_paths`, `exclude`,
   `compile_commands`, `-I` flags, SARIF `path`) must stay inside the project root unless

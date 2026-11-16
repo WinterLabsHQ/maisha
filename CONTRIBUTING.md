@@ -41,7 +41,7 @@ suite first:
 | Rule | Corpus findings | The shape that was missed |
 |---|---:|---|
 | 20.1 | 927 | continuation lines of a multi-line `#define` counted as code |
-| 15.2 | 423 | `goto cleanup;` resolved against another function's label |
+| 15.2 | 423 | `goto cleanup;` resolved against another function's label (re-implemented on function frames, 0 false positives in 199 hits, see VALIDATION.md 4.1) |
 | 16.3 | 452 | `#endif` between clauses read as the clause's last statement |
 | 20.11 | 109 | `a ## NAME ## b` matched via the 2nd char of the first paste |
 | 17.4 | 69 | returns hidden inside macros (`MBEDTLS_MPS_TRACE_RETURN`) |

@@ -435,8 +435,8 @@ With cppcheck missing, `maishac scan` prints a coverage warning instead of imply
 
 ```console
 $ maishac scan bad.c
-WARNING: Reduced coverage: 56/107 detectable rules active (52%).
-  - cppcheck not installed (cppcheck): 51 rule(s) unchecked, e.g. CERT ARR30-C, CERT ARR32-C, CERT DCL30-C
+WARNING: Reduced coverage: 57/107 detectable rules active (53%).
+  - cppcheck not installed (cppcheck): 50 rule(s) unchecked, e.g. CERT ARR30-C, CERT ARR32-C, CERT DCL30-C
 A clean result here does NOT mean the code is compliant with the rules above - they were never checked. ...
 
 $ maishac gate bad.c > /dev/null; echo $?
@@ -454,7 +454,7 @@ The three rule knowledge bases hold **214 rules** with original paraphrased summ
 | CERT C | 122 | 34 | 88 |
 | **Total** | **214** | **107** | **107** |
 
-*Reference* entries are carried for cross-standard equivalence, deviation records and SARIF import. Maisha does not find them for you. On a machine with only the zero-dependency tools, `maishac doctor` reports how many enforced rules are reachable (56 of 107 with native, clang-tidy and gcc; installing cppcheck raises that). Every covered rule and the analyzer behind it is listed in [COVERAGE.md](COVERAGE.md), generated from the code so gaps are explicit.
+*Reference* entries are carried for cross-standard equivalence, deviation records and SARIF import. Maisha does not find them for you. On a machine with only the zero-dependency tools, `maishac doctor` reports how many enforced rules are reachable (57 of 107 with native, clang-tidy and gcc; installing cppcheck raises that). Every covered rule and the analyzer behind it is listed in [COVERAGE.md](COVERAGE.md), generated from the code so gaps are explicit.
 
 ## 🧭 Scope and limitations
 
