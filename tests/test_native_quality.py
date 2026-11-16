@@ -46,6 +46,31 @@ def test_declarations_and_definitions_are_not_banned_calls(tmp_path):
     assert not [x for x in f if "banned function" in x.message], [x.message for x in f]
 
 
+def test_return_type_on_previous_line_is_a_definition_not_a_call(tmp_path):
+    code = (
+        "void\n"
+        "free(void *p)\n"
+        "{\n"
+        "    my_free(p);\n"
+        "}\n"
+        "static char *\n"
+        "strcpy(char *d, const char *s);\n"
+        "void g(void *x) {\n"
+        "    int a;\n"
+        "    free(x);\n"
+        "}\n"
+    )
+    f = _scan(code, tmp_path)
+    assert _lines(f, "21.3") == [10], [x.message for x in f]
+    assert not _lines(f, "STR31")
+
+
+def test_banned_call_after_keyword_line_is_still_flagged(tmp_path):
+    code = "void g(int c, void *x) {\nif (c)\nfree(x);\nelse\nfree(x);\n}\n"
+    f = _scan(code, tmp_path)
+    assert _lines(f, "21.3") == [3, 5], [x.message for x in f]
+
+
 def test_real_banned_calls_still_flagged(tmp_path):
     code = (
         "void g(char *d, const char *s, void *x) {\n"

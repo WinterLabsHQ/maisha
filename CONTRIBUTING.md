@@ -10,9 +10,13 @@ patterns, or analyzer adapters. This guide shows you where.
 ```bash
 git clone https://github.com/WinterLabsHQ/maisha.git
 cd maisha
-pip install -e ".[dev,mcp]"    # editable install + pytest + MCP server (optional extra)
+pip install -e ".[dev,mcp]"    # editable install + pytest, hypothesis, jsonschema, pyyaml + MCP server (optional extra)
 python -m pytest -q            # should be green before you start; MCP tests skip without the extra
 ```
+
+`pytest` is configured to collect only `tests/` (`testpaths`), so the benchmark
+corpora cloned by `benchmark/corpora/CLONE.sh` are never picked up. The workflow
+tests (`tests/test_workflows.py`) need `pyyaml` (part of `dev`) and skip without it.
 
 `python` may not be on your PATH — use `python3`. Optional analyzers
 (`cppcheck`, `clang-tidy`) increase coverage but are never required: the native

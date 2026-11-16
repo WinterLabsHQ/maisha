@@ -133,9 +133,18 @@ _DEFINE_PREFIX_RE = re.compile(r"^\s*#\s*(?:define|undef)\s+$")
 _CALL_KEYWORDS = frozenset({"return", "else", "do", "case", "goto", "sizeof"})
 
 
-def _is_library_call(line: str, m: "re.Match[str]") -> bool:
+# GNU/BSD style: the return type alone on the line above a definition whose name
+# starts in column 0 (`void\nfree(void *p)`). Both lines must start in column 0,
+# which no statement inside a function body does in this style.
+_BARE_TYPE_LINE_RE = re.compile(r"^[A-Za-z_][\w ]*[\s*]*$")
+
+
+def _is_library_call(line: str, m: "re.Match[str]", prev_line: str = "") -> bool:
     """True when the banned-name match at `m` is a call, not a member or a declaration."""
     prefix = line[:m.start()]
+    if (not prefix and prev_line and _BARE_TYPE_LINE_RE.match(prev_line.rstrip())
+            and not set(re.findall(r"[A-Za-z_]\w*", prev_line)) & (_CALL_KEYWORDS | {"if", "while", "for"})):
+        return False
     if _MEMBER_PREFIX_RE.search(prefix) or _DEFINE_PREFIX_RE.match(prefix):
         return False
     if _DECL_PREFIX_RE.match(prefix):
@@ -702,7 +711,8 @@ class NativeAnalyzer(Analyzer):
             raw = raw_lines[i - 1] if i <= len(raw_lines) else ""
 
             for m in _CALL_RE.finditer(line):
-                if not _is_library_call(line, m):
+                prev = clean_lines[i - 2] if i >= 2 else ""
+                if not _is_library_call(line, m, prev):
                     continue
                 fn = m.group(1)
                 rule, why = BANNED_CALLS[fn]
