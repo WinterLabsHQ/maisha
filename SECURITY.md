@@ -22,9 +22,15 @@ relevant attack surface is local, not network-facing:
 
 - **Subprocess execution** — `maishac scan`/`session verify` shell out to
   `cppcheck` and `clang-tidy` on files you point it at, and `session begin
-  --test-command` runs an arbitrary shell command you configure. Treat
-  `test_command` and scanned paths as trusted input, the same as any other
-  local build tooling.
+  --test-command` runs a command you configure (shlex-split, no shell, 600 s
+  default timeout, process group killed on timeout). The test command can only
+  be set by a human (CLI flag, `MAISHAC_TEST_COMMAND`, `.maishac/config.json`),
+  never through an MCP tool; treat the command, that config file and scanned
+  paths as trusted input, the same as any other local build tooling.
+- **Agent sign-offs** — over MCP, approve/deviate/suppress/recategorize only
+  create proposals a person must accept on the CLI, unless the operator sets
+  `MAISHAC_ALLOW_AGENT_APPROVALS=1` (unsafe; flagged in reports). MISRA Mandatory
+  guidelines can never be suppressed or deviated.
 - **SARIF import** (`maishac import`, `compliance_import_sarif`) parses
   external JSON/XML. Only import SARIF files from analyzers you trust.
 - **Project memory** (`.maishac/memory.db`) is a local SQLite file with no

@@ -18,8 +18,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from .engine import LoopEngine
-from .memory import MemoryStore, MandatoryRuleError
+from .engine import LoopEngine, agent_approvals_allowed
 from .rules import REGISTRY
 from . import report as report_mod
 
@@ -29,7 +28,9 @@ mcp = FastMCP(
         "Maisha is a compliance harness for MISRA C:2012, BARR-C:2018 and CERT C. "
         "Typical flow: compliance_begin_session -> compliance_next_batch -> "
         "(compliance_record_attempt, edit code) -> compliance_verify -> repeat until "
-        "converged. Use compliance_explain_rule for guidance, memory_* tools to persist "
+        "converged. Approvals, deviations, suppressions and re-categorizations you "
+        "request are only PROPOSALS that a human must accept with the maishac CLI. "
+        "Use compliance_explain_rule for guidance, memory_* tools to persist "
         "project knowledge, and compliance_report for an auditable summary."),
 )
 
@@ -40,12 +41,22 @@ def _engine() -> LoopEngine:
     global _ENGINE
     if _ENGINE is None:
         root = os.environ.get("MAISHAC_PROJECT", os.getcwd())
-        _ENGINE = LoopEngine(root)
+        _ENGINE = LoopEngine(root, source="mcp")
     return _ENGINE
 
 
 def _j(obj) -> str:
     return json.dumps(obj, indent=2, default=str)
+
+
+def _signoff(kind: str, direct, **args) -> str:
+    """Route a sign-off tool call. By default the agent only *proposes*: the
+    change is recorded as pending_human and takes effect when a person runs
+    `maishac proposals accept`. MAISHAC_ALLOW_AGENT_APPROVALS=1 (unsafe) applies
+    it directly, recorded with source=mcp and flagged in reports."""
+    if agent_approvals_allowed():
+        return _j(direct(**args))
+    return _j(_engine().propose(kind, **args))
 
 
 # ------------------------------------------------------------------ scanning
@@ -227,7 +238,6 @@ def compliance_begin_session(paths: list[str], max_iterations: int = 10,
                              batch_size: int = 5,
                              severity_floor: str = "minor",
                              verification_policy: str | None = None,
-                             test_command: str | None = None,
                              force: bool = False,
                              include_paths: list[str] | None = None,
                              exclude: list[str] | None = None,
@@ -246,12 +256,14 @@ def compliance_begin_session(paths: list[str], max_iterations: int = 10,
         verification_policy: How a fix is confirmed resolved:
             "analyzer_only" (the analyzer stopped flagging it — NOT recommended
             for compliance; it can't see behavior changes at sentinel/boundary
-            values), "test_gated" (a passing test_command confirms fixes), or
+            values), "test_gated" (a passing human-configured test command confirms fixes), or
             "human_gated" (a human must call compliance_approve_finding).
-            Default: test_gated if test_command is given, else human_gated.
-        test_command: Shell command that must exit 0 to confirm fixes at verify
-            time, e.g. "make test". High-severity and semantic-risk findings
-            (casts/comparisons/conversions) still require human approval.
+            Default: test_gated if the HUMAN configured a test command (CLI
+            --test-command, MAISHAC_TEST_COMMAND or .maishac/config.json), else
+            human_gated. An agent cannot set the test command: it runs on the
+            host, so only the person running the project may choose it.
+            High-severity and semantic-risk findings (casts/comparisons/
+            conversions) still require human approval.
         force: Start a new session even if one is already active on this project
             (otherwise begin returns the active session id so you can resume it).
         include_paths: Header search dirs forwarded to cppcheck/clang-tidy as -I
@@ -266,7 +278,7 @@ def compliance_begin_session(paths: list[str], max_iterations: int = 10,
     return _j(_engine().begin_session(paths, {
         "max_iterations": max_iterations, "batch_size": batch_size,
         "severity_floor": severity_floor, "verification_policy": verification_policy,
-        "test_command": test_command, "include_paths": include_paths,
+        "include_paths": include_paths,
         "exclude": exclude, "std": std, "compiler_flags": compiler_flags,
         "compile_commands": compile_commands}, force=force))
 
@@ -335,95 +347,125 @@ def compliance_import_sarif(path: str) -> str:
     IAR C-STAT, or cppcheck's own --sarif) gets the same loop, memory, gate and
     deviation treatment as a native scan. Recognized MISRA/CERT ruleIds map onto
     the knowledge base; others are kept as `sarif:<ruleId>`. Imported findings
-    are NOT cleared by native rescans.
+    are NOT cleared by native rescans. Suppressions inside the file are NOT
+    applied when the import comes from an agent (they would let a crafted file
+    hide findings); a person can carry them over with `maishac import`.
 
     Args:
         path: Path to the SARIF file (relative to the project root or absolute).
     """
-    return _j(_engine().import_sarif(path))
+    return _j(_engine().import_sarif(path, carry_suppressions=agent_approvals_allowed()))
 
 
 @mcp.tool()
-def compliance_approve_finding(fingerprint: str, approved_by: str) -> str:
-    """Human sign-off that a fix is genuinely correct, moving a finding from
+def compliance_approve_finding(fingerprint: str, approved_by: str = "") -> str:
+    """Propose that a fix is genuinely correct, moving a finding from
     pending_verification to resolved. Required for high-severity and
     semantic-risk findings (casts, comparisons, sign conversions, control-flow
     changes) whose fix a passing test suite alone cannot vouch for — the
     analyzer only checks the pattern is gone, never that the edit preserved the
     intended behavior at sentinel/boundary values.
 
+    HUMAN SIGN-OFF REQUIRED: by default this does NOT take effect. It records a
+    proposal (status pending_human) that a person finalizes with
+    `maishac proposals accept <id> --by <name>`. Report the proposal id to the
+    user and carry on with other work; do not retry or look for a way around it.
+    (The operator can set MAISHAC_ALLOW_AGENT_APPROVALS=1 to apply it directly;
+    that is unsafe and is flagged in reports.)
+
     Args:
         fingerprint: The pending finding's fingerprint (from compliance_verify).
-        approved_by: Who is signing off — recorded in the audit trail.
+        approved_by: Who you expect to sign off (informational; the human who
+            accepts the proposal is the one recorded).
     """
-    return _j(_engine().approve(fingerprint, approved_by))
+    return _signoff("approve", _engine().approve, fingerprint=fingerprint,
+                    approved_by=approved_by)
 
 
 # ---------------------------------------------------- deviations/suppression
 @mcp.tool()
 def compliance_add_deviation(rule: str, scope: str, justification: str,
                              approver: str = "", expires_days: float = 0) -> str:
-    """Record a formal, justified deviation from a rule (MISRA-style deviation
-    record). Deviated findings stop counting against compliance but stay in the
-    audit trail. Use sparingly and only with a real engineering justification.
+    """Propose a formal, justified deviation from a rule (MISRA-style deviation
+    record). Once a human accepts it, deviated findings stop counting against
+    compliance but stay in the audit trail. Use sparingly and only with a real
+    engineering justification. MISRA Mandatory guidelines (including ones a GRP
+    entry made Mandatory) can never be deviated.
+
+    HUMAN SIGN-OFF REQUIRED: by default this does NOT take effect. It records a
+    proposal (status pending_human) that a person finalizes with
+    `maishac proposals accept <id> --by <name>`. Report the proposal id to the
+    user and carry on with other work; do not retry or look for a way around it.
+    (The operator can set MAISHAC_ALLOW_AGENT_APPROVALS=1 to apply it directly;
+    that is unsafe and is flagged in reports.)
 
     Args:
-        rule: Rule reference, e.g. "MISRA 21.6".
+        rule: Exact rule reference, e.g. "MISRA 21.6", "MISRA Dir 4.6",
+            "CERT STR31-C". Partial references ("misra", "21") are rejected.
         scope: Glob over project-relative file paths, e.g. "src/debug/*" or "*".
-        justification: Engineering rationale (required, be specific).
-        approver: Person/role approving the deviation.
-        expires_days: Auto-expire after N days (0 = never).
+        justification: Engineering rationale (required, at least 15 characters).
+        approver: Person/role you expect to approve (informational).
+        expires_days: Auto-expire after N days (0 = never; negative is rejected).
     """
-    meta = REGISTRY.resolve(rule)
-    if not meta:
-        return _j({"error": f"Unknown rule '{rule}'."})
-    if len(justification.strip()) < 15:
-        return _j({"error": "Justification too short; write a real engineering rationale."})
-    try:
-        did = _engine().mem.add_deviation(meta["id"], scope, justification, approver,
-                                          expires_days or None)
-    except MandatoryRuleError as e:
-        return _j({"error": str(e)})
-    return _j({"deviation_id": did, "rule_id": meta["id"], "scope": scope,
-               "note": "Re-run compliance_scan or compliance_verify to apply."})
+    return _signoff("deviate", _engine().deviate, rule=rule, scope=scope,
+                    justification=justification, approver=approver,
+                    expires_days=expires_days or None)
 
 
 @mcp.tool()
 def compliance_recategorize(rule: str, to_category: str, rationale: str,
                             approver: str = "") -> str:
-    """Record a MISRA Guideline Re-categorization Plan (GRP) entry — an agreed,
+    """Propose a MISRA Guideline Re-categorization Plan (GRP) entry — an agreed,
     project-wide change to a guideline's category. Legality is enforced per MISRA
     Compliance:2020: Advisory → Mandatory/Required/Disapplied; Required →
-    Mandatory only; a Mandatory guideline may not be re-categorized at all. The
-    new category flows into the compliance summary (a Disapplied guideline is
-    removed from the compliance argument; a Mandatory one can no longer be
-    deviated). Show it with compliance_report(format="grp").
+    Mandatory only; a Mandatory guideline may not be re-categorized at all. Once
+    accepted, the new category flows into the compliance summary (a Disapplied
+    guideline is removed from the compliance argument; a Mandatory one can no
+    longer be deviated or suppressed). Show it with compliance_report(format="grp").
+
+    HUMAN SIGN-OFF REQUIRED: by default this does NOT take effect. It records a
+    proposal (status pending_human) that a person finalizes with
+    `maishac proposals accept <id> --by <name>`. Report the proposal id to the
+    user and carry on with other work; do not retry or look for a way around it.
+    (The operator can set MAISHAC_ALLOW_AGENT_APPROVALS=1 to apply it directly;
+    that is unsafe and is flagged in reports.)
 
     Args:
         rule: Rule reference, e.g. "MISRA 15.5".
         to_category: mandatory | required | advisory | disapplied.
         rationale: Why (agreed between acquirer and supplier). Required.
-        approver: Person/role approving the re-categorization.
+        approver: Person/role you expect to approve (informational).
     """
-    return _j(_engine().recategorize(rule, to_category, rationale, approver))
+    return _signoff("recategorize", _engine().recategorize, rule=rule,
+                    to_category=to_category, rationale=rationale, approver=approver)
 
 
 @mcp.tool()
 def compliance_suppress_finding(fingerprint: str, reason: str) -> str:
-    """Mark one specific finding as a false positive. Requires a reason;
-    suppressions are permanent for that fingerprint and audited.
+    """Propose marking one specific finding as a false positive. Requires a
+    reason (at least 10 characters). Findings of MISRA Mandatory guidelines can
+    never be suppressed. Once a human accepts it the suppression is audited and
+    can be removed with `maishac unsuppress`.
+
+    HUMAN SIGN-OFF REQUIRED: by default this does NOT take effect. It records a
+    proposal (status pending_human) that a person finalizes with
+    `maishac proposals accept <id> --by <name>`. Report the proposal id to the
+    user and carry on with other work; do not retry or look for a way around it.
+    (The operator can set MAISHAC_ALLOW_AGENT_APPROVALS=1 to apply it directly;
+    that is unsafe and is flagged in reports.)
 
     Args:
         fingerprint: The finding fingerprint.
         reason: Why this is a false positive.
     """
-    eng = _engine()
-    if not eng.mem.get_finding(fingerprint):
-        return _j({"error": f"No finding with fingerprint '{fingerprint}'."})
-    if len(reason.strip()) < 10:
-        return _j({"error": "Reason too short; explain why the analyzer is wrong here."})
-    eng.mem.suppress(fingerprint, reason)
-    return _j({"suppressed": fingerprint})
+    return _signoff("suppress", _engine().suppress, fingerprint=fingerprint, reason=reason)
+
+
+@mcp.tool()
+def compliance_list_proposals() -> str:
+    """List sign-off proposals still waiting for a human (pending_human). Use it
+    to remind the user what needs their decision; you cannot accept them."""
+    return _j(_engine().list_proposals())
 
 
 # -------------------------------------------------------------------- memory

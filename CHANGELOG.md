@@ -5,6 +5,42 @@ All notable changes to Maisha are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Security
+- **An MCP agent can no longer approve its own work.** `compliance_approve_finding`,
+  `compliance_add_deviation`, `compliance_recategorize` and
+  `compliance_suppress_finding` now create *proposals* (`pending_human`) that a
+  person finalizes with `maishac proposals accept <id> --by <name>` (or the direct
+  CLI commands). `MAISHAC_ALLOW_AGENT_APPROVALS=1` restores the old direct
+  behaviour; it is documented as unsafe, recorded with `source=mcp` and flagged in
+  reports. Suppressions in a SARIF file are not carried over by an agent-started import.
+- **`test_command` is human-only.** It is no longer an argument of
+  `compliance_begin_session`; set it with `--test-command`, `MAISHAC_TEST_COMMAND`
+  or `.maishac/config.json`. It runs without a shell (shlex argv), with a 600 s
+  default timeout (was 1800 s) and the whole process group is killed on timeout.
+- **MISRA Mandatory guidelines can not be suppressed**, including through a SARIF
+  import, and deviation/suppression checks use the category after GRP
+  re-categorization. Existing suppressions/permits on Mandatory rules are ignored at
+  the next scan.
+
+### Added
+- Append-only `audit_log` (every approval, suppression, deviation,
+  re-categorization, revocation, proposal decision, session start/end), `maishac audit`,
+  and an audit section in the markdown report. Entries from agents are marked.
+- `maishac unsuppress`, `revoke-deviation`, `uncategorize`; suppressions gain
+  approver, source and optional expiry (`--approver`, `--expires`, `--expires-days`).
+- Schema v3 (migrates in place): `source` on suppressions/deviations/
+  recategorizations, `approval_source` on findings, `proposals` and `audit_log` tables.
+
+### Changed
+- `REGISTRY.resolve` is exact: no more substring fallback, so `deviate "misra"` or
+  `deviate "21"` fail with a helpful message instead of binding to some rule;
+  `MISRA Dir 4.1` no longer resolves to Rule 4.1, and a bare number matching both a
+  Rule and a Directive is rejected as ambiguous. Use `REGISTRY.search()` for fuzzy lookup.
+- The CLI `suppress`/`deviate` apply the same validation as the MCP tools (reason/
+  justification length, fingerprint must exist, no negative or past expiry);
+  `--expires YYYY-MM-DD` now means the end of that day.
+- Replacing a suppression no longer loses the earlier reason; it is kept in the audit log.
+
 ## [0.4.0] - 2026-07-19
 
 ### Changed

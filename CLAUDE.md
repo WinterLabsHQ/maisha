@@ -37,7 +37,10 @@ maishac session batch <id>        # next prioritized batch (JSON briefings)
 maishac session verify <id>       # rescan, diff, grade attempts, run test gate
 maishac approve <fingerprint> --by lead@example.com
 maishac deviate "MISRA 19.2" -s "drivers/**" -j "..." --approver lead@example.com --expires 2027-01-01
-maishac suppress <fingerprint> -r "false positive: ..."
+maishac suppress <fingerprint> -r "false positive: ..." --approver lead@example.com
+maishac unsuppress <fingerprint> | revoke-deviation <id> | uncategorize "MISRA 15.5"
+maishac proposals list|accept <id> --by me|reject <id> --by me   # MCP agents only propose
+maishac audit                     # append-only audit log (also a report section)
 maishac note "..." -t <tag>
 maishac report --format sarif > compliance.sarif
 maishac import findings.sarif     # ingest an external qualified engine's SARIF

@@ -230,7 +230,13 @@ maishac session status abc123
 maishac deviate "MISRA 19.2" --scope "drivers/**" \
     --justification "Union required for hardware register overlay mapping" \
     --approver lead@example.com --expires 2027-01-01
-maishac suppress <fingerprint> --reason "false positive: macro expansion"
+maishac suppress <fingerprint> --reason "false positive: macro expansion" --approver lead@example.com
+maishac unsuppress <fingerprint> --by lead@example.com          # revocations are audited too
+maishac revoke-deviation <deviation-id> --by lead@example.com
+maishac uncategorize "MISRA 15.1" --by lead@example.com
+maishac proposals list                                          # sign-offs an MCP agent asked for
+maishac proposals accept <id> --by lead@example.com             # ...and the human decision
+maishac audit                                                   # append-only history of every sign-off
 maishac note "This codebase uses FreeRTOS; heap_4 allocator is approved" --tags misra-21.3
 maishac recategorize "MISRA 15.1" --to disapplied \
     --rationale "No goto in this codebase; disapplied by acquirer/supplier agreement" \
@@ -282,11 +288,12 @@ The recommended agent protocol is documented in
 | `compliance_next_batch` | Next prioritized batch, regressions first, with per-finding briefings |
 | `compliance_record_attempt` | Log the strategy used on a finding (auto-graded on verify) |
 | `compliance_verify` | Rescan, diff, grade attempts, run the test gate, advance state machine |
-| `compliance_approve_finding` | Human sign-off moving a `pending_verification` finding to `resolved` (required for semantic-risk / high-severity fixes) |
+| `compliance_approve_finding` | **Proposes** a human sign-off moving a `pending_verification` finding to `resolved` (required for semantic-risk / high-severity fixes). Takes effect only when a person runs `maishac proposals accept` (see below) |
 | `compliance_session_status` | Progress, iteration budget, state (`active`/`awaiting_verification`/`converged`/`stalled`/`budget_exhausted`) |
-| `compliance_add_deviation` | MISRA-style deviation record (justification ≥ 15 chars enforced) |
-| `compliance_recategorize` | MISRA GRP re-categorization (legality enforced: no Mandatory re-cat; Required→Advisory/Disapplied forbidden) |
-| `compliance_suppress_finding` | Mark a fingerprint as false positive (reason required) |
+| `compliance_add_deviation` | **Proposes** a MISRA-style deviation record (justification ≥ 15 chars enforced; never for Mandatory guidelines) |
+| `compliance_recategorize` | **Proposes** a MISRA GRP re-categorization (legality enforced: no Mandatory re-cat; Required→Advisory/Disapplied forbidden) |
+| `compliance_suppress_finding` | **Proposes** marking a fingerprint as false positive (reason ≥ 10 chars; never for Mandatory guidelines) |
+| `compliance_list_proposals` | Sign-off proposals still waiting for a human |
 | `memory_note` / `memory_search` / `memory_stats` | Project convention memory |
 | `compliance_import_sarif` | Ingest an external engine's SARIF (qualified engine or cppcheck `--output-format=sarif`) into the same loop/memory/gate; **honors `result.suppressions`** so a team's existing triage/baseline carries over instead of resurfacing as fresh violations |
 | `compliance_report` | Markdown, JSON, SARIF 2.1.0, or the MISRA Compliance:2020 evidence set: `misra-compliance` (GCS), `gep` (enforcement plan), `grp` (re-categorization plan) |
@@ -336,10 +343,10 @@ So a fix does **not** go straight to `resolved`. It enters
 | Policy | A pending fix becomes `resolved` when… |
 |---|---|
 | `analyzer_only` | the analyzer stops flagging it (⚠️ not recommended for compliance work) |
-| `test_gated` | a configured `test_command` exits 0 |
+| `test_gated` | the human-configured test command exits 0 |
 | `human_gated` | a human calls `approve_finding` |
 
-Default: `test_gated` if a `test_command` is configured, else `human_gated`.
+Default: `test_gated` if a test command is configured, else `human_gated`.
 Regardless of policy, **semantic-risk findings** (casts, comparisons, sign
 conversions, control-flow changes) and **high-severity findings** always require
 human approval — a green test suite that never exercises the sentinel case cannot
@@ -363,6 +370,44 @@ maishac session begin src/ --verification-policy test_gated --test-command "make
 maishac session verify <id>          # -> awaiting_verification if fixes need sign-off
 maishac approve <fingerprint> --by lead@example.com
 ```
+
+### Who may sign off: agents propose, humans decide
+
+An agent that can approve its own fixes, suppress the findings it cannot fix, or
+write itself a deviation has no gate at all. So the MCP tools
+`compliance_approve_finding`, `compliance_add_deviation`,
+`compliance_recategorize` and `compliance_suppress_finding` **only create a
+proposal** (status `pending_human`). Nothing changes until a person runs
+
+```bash
+maishac proposals list
+maishac proposals accept <id> --by lead@example.com   # or: reject <id> --by ... -r "why"
+```
+
+(or the direct commands `approve` / `deviate` / `suppress` / `recategorize`).
+The person who accepts is recorded as the approver. Every entry also records its
+`source` (`cli`/`mcp`/`import`), and every sign-off, revocation and session
+start/end goes into an append-only `audit_log` (`maishac audit`, and a short
+section in the markdown report).
+
+Setting `MAISHAC_ALLOW_AGENT_APPROVALS=1` in the MCP server's environment makes
+those tools act directly. **This is unsafe**: the agent then grades its own work.
+Such entries are stored with `source=mcp`, marked `[AGENT-ORIGINATED]` in
+reports, and flagged with a warning. MISRA Mandatory guidelines (judged after
+GRP re-categorization) can never be suppressed or deviated, whatever the mode.
+Suppressions inside a SARIF file are not carried over when an agent starts the
+import; use `maishac import` yourself.
+
+### The test command is human-only
+
+The test command runs on your machine, so an MCP agent cannot set it
+(`compliance_begin_session` has no such argument). Configure it with
+`--test-command`, the `MAISHAC_TEST_COMMAND` environment variable, or
+`{"test_command": "make test", "test_timeout": 600}` in `.maishac/config.json`
+(first one found wins, in that order). It is split with `shlex` and run **without
+a shell**; write `sh -c 'a && b'` if you need pipes or `&&`. The default timeout
+is 600 s (`--test-timeout`, `MAISHAC_TEST_TIMEOUT`); on timeout the whole process
+group is killed.
 
 ## Teams & concurrency
 

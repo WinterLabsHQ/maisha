@@ -43,11 +43,18 @@ Rules of engagement:
   the attempt with strategy `"needs-behavioral-decision"` and move on.
 - Regressions in the batch (marked `REGRESSED`) take priority over everything.
 - If the finding is a false positive, call `compliance_suppress_finding` with a
-  concrete reason — do not silently skip it.
+  concrete reason — do not silently skip it. This only records a **proposal**:
+  a human has to accept it (`maishac proposals accept <id> --by <name>`), so the
+  finding stays open until then. Never try to work around that.
 - If the code is genuinely correct but non-compliant for a documented hardware
   or platform reason, call `compliance_add_deviation` with a real justification
-  (≥ 15 chars enforced), a tight `scope` glob, and an approver. Deviations are
-  audit records, not escape hatches.
+  (≥ 15 chars enforced) and a tight `scope` glob. Deviations are audit records,
+  not escape hatches, and like suppressions they are **proposals** a human must
+  accept. MISRA Mandatory guidelines can never be suppressed or deviated: fix them.
+- `compliance_approve_finding` and `compliance_recategorize` follow the same
+  rule. Tell the user which proposal ids are waiting (`compliance_list_proposals`)
+  and keep working on other findings. You cannot set the test command either;
+  that is configured by the human running the project.
 
 ### 4. Record
 
@@ -80,8 +87,8 @@ summary — never keep retrying them.
 ### 6. Finish
 
 On any terminal state, call `compliance_report(format="markdown")` and present
-it, along with: findings you suppressed (and why), deviations you added, and
-anything frozen for human review.
+it, along with: suppressions and deviations you proposed (and why, with their
+proposal ids), and anything frozen for human review.
 
 ## Memory etiquette
 
