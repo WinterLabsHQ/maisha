@@ -35,7 +35,9 @@ import subprocess
 import time
 from pathlib import Path
 
-from ..analyzers import run_scan, available_analyzers
+from ..analyzers import run_scan_detailed, available_analyzers
+from ..analyzers.base import validate_compiler_flags
+from ..model import relpath
 from ..memory import MemoryStore
 from ..rules import REGISTRY
 
@@ -56,6 +58,11 @@ DEFAULT_CONFIG = {
     "verification_policy": None,
     "test_command": None,       # shell command; exit 0 confirms pending fixes
     "include_paths": None,      # -I dirs forwarded to cppcheck/clang-tidy
+    "exclude": None,            # extra fnmatch patterns for directories to skip
+    "default_excludes": True,   # also skip .git, build, node_modules, ... (see analyzers.base)
+    "std": None,                # C standard for compiler/clang-tidy (default c11)
+    "compiler_flags": None,     # extra -D/-U/-I/-std flags (closed list, validated)
+    "compile_commands": None,   # compile_commands.json to take per-file flags from
 }
 
 _VALID_POLICIES = ("analyzer_only", "test_gated", "human_gated")
@@ -75,17 +82,26 @@ class LoopEngine:
 
     # ------------------------------------------------------------------ scan
     def scan(self, paths: list[str], analyzers: list[str] | None = None,
-             gate: bool = False, include_paths: list[str] | None = None) -> dict:
-        findings, used = run_scan(paths, self.root, analyzers, include_paths)
-        from ..analyzers.base import collect_c_files
-        scanned = [str(f.resolve().relative_to(self.root)) if str(f).startswith(str(self.root))
-                   else str(f) for f in collect_c_files(paths, self.root)]
-        diff = self.mem.sync_scan(findings, scanned, gate=gate, producers=set(used))
+             gate: bool = False, include_paths: list[str] | None = None,
+             exclude: list[str] | None = None, default_excludes: bool = True,
+             std: str | None = None, compiler_flags: list[str] | None = None,
+             compile_commands: str | None = None) -> dict:
+        flags = validate_compiler_flags(compiler_flags)
+        options = {"std": std, "compiler_flags": flags, "compile_commands": compile_commands}
+        sr = run_scan_detailed(paths, self.root, analyzers, include_paths,
+                               exclude, default_excludes, options)
+        findings = sr.findings
+        used = sr.analyzers_used
+        scanned = [relpath(f, self.root) for f in sr.files]
+        # Only files an analyzer really analyzed can have findings cleared by
+        # it: a crashed/timed-out/non-compiling run must never look like a fix.
+        diff = self.mem.sync_scan(findings, scanned, gate=gate, analyzed=sr.analyzed)
         # Every scan states what it could NOT check. Without this a native-only
         # run returns a clean result indistinguishable from a full-toolchain
         # clean result, which silently overstates compliance.
-        from ..coverage import toolchain_status, toolchain_warning
+        from ..coverage import analyzer_failure_warning, toolchain_status, toolchain_warning
         tc = toolchain_status(analyzers)
+        errors = sr.errors
         out = {
             "analyzers_used": used,
             "files_scanned": len(scanned),
@@ -94,9 +110,13 @@ class LoopEngine:
             "open": len(self.mem.open_findings(limit=100000)),
             "pending_verification": self.mem.count_pending(),
             "toolchain": tc,
+            "analyzer_errors": errors,
+            "analysis_complete": not errors,
         }
-        if tc["degraded"]:
-            out["coverage_warning"] = toolchain_warning(tc)
+        warnings = [w for w in (toolchain_warning(tc) if tc["degraded"] else "",
+                                analyzer_failure_warning(errors)) if w]
+        if warnings:
+            out["coverage_warning"] = "\n".join(warnings)
         return out
 
     def import_sarif(self, path: str | Path) -> dict:
@@ -169,6 +189,16 @@ class LoopEngine:
         return {"topic": topic, "patterns": patterns_mod.guidance(topic, limit)}
 
     @staticmethod
+    def _scan_kwargs(cfg: dict) -> dict:
+        """Session config -> scan() keyword arguments."""
+        return {"include_paths": cfg.get("include_paths"),
+                "exclude": cfg.get("exclude"),
+                "default_excludes": cfg.get("default_excludes", True),
+                "std": cfg.get("std"),
+                "compiler_flags": cfg.get("compiler_flags"),
+                "compile_commands": cfg.get("compile_commands")}
+
+    @staticmethod
     def _policy(cfg: dict) -> str:
         p = cfg.get("verification_policy")
         if p in _VALID_POLICIES:
@@ -235,7 +265,7 @@ class LoopEngine:
                              f"({existing['id']}). Resume it (session_status/next_batch), "
                              "or pass force to start a fresh one anyway.",
                     "active_session_id": existing["id"]}
-        baseline = self.scan(paths, cfg.get("analyzers"), include_paths=cfg.get("include_paths"))
+        baseline = self.scan(paths, cfg.get("analyzers"), **self._scan_kwargs(cfg))
         sid = self.mem.create_session(cfg)
         self.mem.update_session(sid, history=[{
             "iteration": 0, "event": "baseline",
@@ -312,7 +342,8 @@ class LoopEngine:
         cfg = sess["config"]
         policy = self._policy(cfg)
         result = self.scan(cfg["paths"], cfg.get("analyzers"), gate=policy != "analyzer_only",
-                          include_paths=cfg.get("include_paths"))
+                           **self._scan_kwargs(cfg))
+        analyzer_errors = result["analyzer_errors"]
         iteration = sess["iteration"] + 1
         history = sess["history"]
         prev_open = history[-1]["open"] if history else result["open"]
@@ -336,7 +367,26 @@ class LoopEngine:
                         "pending": pending, "diff": result["diff"], "ts": time.time()})
 
         state, reason = "active", ""
-        if open_now == 0 and pending == 0:
+        budget_spent = iteration >= cfg.get("max_iterations", 10)
+        if analyzer_errors and open_now == 0:
+            # An analyzer that failed cannot vouch for anything, so "no open
+            # findings" is not evidence of compliance: never converge on it.
+            names = ", ".join(sorted({e["analyzer"] for e in analyzer_errors}))
+            if budget_spent:
+                state = "budget_exhausted"
+                reason = (f"Iteration budget ({cfg['max_iterations']}) reached while "
+                          f"{names} was still failing or only partly running; the "
+                          "analysis is incomplete, so this is NOT a compliant result.")
+            else:
+                # Not terminal: fix the toolchain and verify again (the iteration
+                # budget still bounds the loop).
+                state = "analysis_incomplete"
+                reason = (f"Analysis incomplete: {names} failed or only partly ran, so a "
+                          "clean result cannot be trusted and nothing was resolved on its "
+                          "account. See analyzer_errors, fix the cause, then verify again.")
+            if pending:
+                reason += f" {pending} fix(es) are also still awaiting verification."
+        elif open_now == 0 and pending == 0:
             state, reason = "converged", "All findings resolved, suppressed, or deviated."
         elif open_now == 0 and pending > 0:
             need = []
@@ -378,12 +428,18 @@ class LoopEngine:
             "confirmed_by_test": confirmed_by_test,
             "test_run": test_run,
             "diff": result["diff"],
+            "analyzer_errors": analyzer_errors,
+            "analysis_complete": result["analysis_complete"],
+            **({"coverage_warning": result["coverage_warning"]}
+               if result.get("coverage_warning") else {}),
             "pending_findings": self._brief_many(self.mem.pending_findings()),
             "regressions": self._brief_many(
                 [f for f in self.mem.open_findings(limit=100) if f["status"] == "regressed"]),
             "next": ("Session complete." if state == "converged"
                      else "Approve verified fixes (approve_finding) or call next_batch."
                      if state == "awaiting_verification"
+                     else "Fix the analyzer failure (see analyzer_errors) and call verify again."
+                     if state == "analysis_incomplete"
                      else "Call next_batch for the next set of findings." if state == "active"
                      else "Session ended."),
         }

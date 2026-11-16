@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .base import Analyzer
+from .base import AnalysisResult, Analyzer
 from ..model import Finding, enclosing_function, relpath
 from ..rules import REGISTRY
 
@@ -342,17 +342,24 @@ class NativeAnalyzer(Analyzer):
         from .. import __version__
         return f"maishac {__version__}"
 
-    def analyze(self, files: list[Path], root: Path,
-                include_paths: list[str] | None = None) -> list[Finding]:
+    def run(self, files: list[Path], root: Path,
+            include_paths: list[str] | None = None,
+            options: dict | None = None) -> AnalysisResult:
         # lexical checks need no compilation model, so include paths don't apply here
-        findings: list[Finding] = []
+        res = AnalysisResult(self.name)
         for f in files:
+            rel = relpath(f, root)
             try:
                 src = f.read_text("utf-8", errors="replace")
-            except OSError:
+                res.findings.extend(self._analyze_file(f, src, root))
+            except Exception as e:  # noqa: BLE001 — a file we could not analyze must not look clean
+                res.failed_files.append(rel)
+                res.error = res.error or f"{rel}: {type(e).__name__}: {e}"
                 continue
-            findings.extend(self._analyze_file(f, src, root))
-        return findings
+            res.analyzed_files.append(rel)
+        if res.failed_files:
+            res.status = "partial" if res.analyzed_files else "failed"
+        return res
 
     def analyze_source(self, code: str, filename: str, root: Path) -> list[Finding]:
         """Analyze an in-memory source string (never touches disk) — the entry

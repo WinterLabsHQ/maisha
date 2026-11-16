@@ -9,12 +9,14 @@ under a `cppcheck:<id>` rule so nothing is silently dropped.
 
 from __future__ import annotations
 
+import os
 import re
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from .base import Analyzer
-from ..model import Finding, enclosing_function, relpath
+from .base import AnalysisResult, Analyzer, SourceLines, _tail
+from ..model import Finding, relpath
 from ..rules import REGISTRY
 
 # cppcheck error id -> CERT rule. Every target here must be a CERT rule present
@@ -74,7 +76,13 @@ CPPCHECK_MISRA_MISSING = frozenset({"1.1", "3.2", "12.5"})
 _SEV_MAP = {"error": "critical", "warning": "major", "style": "minor",
             "performance": "minor", "portability": "minor", "information": "info"}
 
-_MISRA_ID = re.compile(r"misra-c2012-(\d+\.\d+)")
+# `misra-c2012-10.1` is a rule, `misra-c2012-dir-4.6` a directive.
+_MISRA_ID = re.compile(r"misra-c2012-(dir-)?(\d+\.\d+)")
+
+# Ids cppcheck raises when it could not process a file at all. The file then
+# has no findings for the wrong reason, so it must not count as analyzed.
+_FATAL_IDS = frozenset({"syntaxError", "cppcheckError", "internalAstError",
+                        "preprocessorErrorDirective", "unknownMacro"})
 
 
 class CppcheckAnalyzer(Analyzer):
@@ -82,40 +90,99 @@ class CppcheckAnalyzer(Analyzer):
     requires = "cppcheck"
     options = "--addon=misra --enable=all (MISRA C:2012 addon)"
 
-    def analyze(self, files: list[Path], root: Path,
-                include_paths: list[str] | None = None) -> list[Finding]:
+    def run(self, files: list[Path], root: Path,
+            include_paths: list[str] | None = None,
+            options: dict | None = None) -> AnalysisResult:
         if not files:
-            return []
+            return AnalysisResult(self.name)
         # Without the project's own include dirs, cppcheck can't see headers like
         # FreeRTOSConfig.h, so it misreports "undefined identifier"/"unresolved
         # declaration" on macros and functions that are perfectly visible to a
         # real build — see BENCHMARKS.md for the measured false-positive cost.
         include_flags = [f"-I{p}" for p in (include_paths or [])]
-        cmd = ["cppcheck", "--enable=all", "--inline-suppr", "--xml",
-               "--suppress=missingIncludeSystem", "--suppress=unusedFunction",
-               "--suppress=checkersReport", "--addon=misra"] \
-              + include_flags + [str(f) for f in files]
+        define_flags = [f for f in (options or {}).get("compiler_flags") or []
+                        if f.startswith(("-D", "-U"))]
+        # The file list goes through --file-list so a large tree cannot exceed
+        # the OS argument-length limit.
+        fd, list_path = tempfile.mkstemp(prefix="maishac-cppcheck-", suffix=".txt")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(str(f) for f in files) + "\n")
+            cmd = ["cppcheck", "--enable=all", "--inline-suppr", "--xml",
+                   "--suppress=missingIncludeSystem", "--suppress=unusedFunction",
+                   "--suppress=checkersReport", "--addon=misra"] \
+                  + include_flags + define_flags + [f"--file-list={list_path}"]
+            return self._run_cppcheck(cmd, files, root)
+        finally:
+            try:
+                os.unlink(list_path)
+            except OSError:
+                pass
+
+    def _run_cppcheck(self, cmd: list[str], files: list[Path], root: Path) -> AnalysisResult:
+        addon_missing = False
         try:
             proc = self._run(cmd)
-        except Exception:
-            return []
-        xml_text = proc.stderr
+        except Exception as e:  # noqa: BLE001 — surfaced as a failed run, never as "clean"
+            return AnalysisResult.failure(self.name, files, root,
+                                          f"cppcheck did not run: {type(e).__name__}: {e}")
+        xml_text = proc.stderr or ""
         if "<results" not in xml_text:
             # addon may be missing; retry without it
+            first_err = _tail(xml_text)
             cmd = [c for c in cmd if not c.startswith("--addon")]
             try:
                 proc = self._run(cmd)
-                xml_text = proc.stderr
-            except Exception:
-                return []
-        return self._parse(xml_text, root)
+            except Exception as e:  # noqa: BLE001
+                return AnalysisResult.failure(self.name, files, root,
+                                              f"cppcheck did not run: {type(e).__name__}: {e}")
+            xml_text = proc.stderr or ""
+            addon_missing = "<results" in xml_text
+            if not addon_missing:
+                return AnalysisResult.failure(
+                    self.name, files, root,
+                    "cppcheck produced no XML report: " + (_tail(xml_text) or first_err or "no output"))
+        try:
+            tree = ET.fromstring(xml_text)
+        except ET.ParseError as e:
+            return AnalysisResult.failure(self.name, files, root,
+                                          f"cppcheck XML report could not be parsed: {e}")
+        findings = self._parse_tree(tree, root)
+        rels = [relpath(f, root) for f in files]
+        res = AnalysisResult(self.name, findings=findings)
+        fatal: dict[str, str] = {}
+        for err in tree.iter("error"):
+            if err.get("id") in _FATAL_IDS:
+                loc = err.find("location")
+                if loc is not None and loc.get("file"):
+                    fatal.setdefault(relpath(loc.get("file"), root),
+                                     f"{err.get('id')}: {err.get('msg', '')}")
+        if addon_missing:
+            # The MISRA addon did not run, so absence of MISRA findings proves
+            # nothing. Claim no file as analyzed: this tool clears nothing.
+            res.status = "partial"
+            res.failed_files = rels
+            res.error = ("cppcheck MISRA addon unavailable; ran core checks only. "
+                         "Findings from cppcheck are not treated as cleared.")
+            return res
+        res.failed_files = [r for r in rels if r in fatal]
+        res.analyzed_files = [r for r in rels if r not in fatal]
+        if res.failed_files:
+            res.status = "partial" if res.analyzed_files else "failed"
+            first = res.failed_files[0]
+            res.error = f"cppcheck could not process {first}: {fatal[first]}"
+        return res
 
     def _parse(self, xml_text: str, root: Path) -> list[Finding]:
-        findings: list[Finding] = []
         try:
             tree = ET.fromstring(xml_text)
         except ET.ParseError:
-            return findings
+            return []
+        return self._parse_tree(tree, root)
+
+    def _parse_tree(self, tree: ET.Element, root: Path) -> list[Finding]:
+        findings: list[Finding] = []
+        src = SourceLines(root)
         for err in tree.iter("error"):
             eid = err.get("id", "")
             msg = err.get("msg", "") or err.get("verbose", "")
@@ -127,15 +194,17 @@ class CppcheckAnalyzer(Analyzer):
             line = int(loc.get("line", "0") or 0)
             col = int(loc.get("column", "0") or 0)
             rel = relpath(fpath, root)
-            line_content, ctx_symbol = self._line_of(root, fpath, line)
+            line_content, ctx_symbol = src.line_of(fpath, line)
 
             m = _MISRA_ID.match(eid)
             if m:
-                meta = REGISTRY.resolve(f"MISRA {m.group(1)}") or {}
-                rid = meta.get("id", f"MISRA-C:2012 Rule {m.group(1)}")
+                kind = "Dir" if m.group(1) else "Rule"
+                rid_default = f"MISRA-C:2012 {kind} {m.group(2)}"
+                meta = REGISTRY.resolve(rid_default) or {}
+                rid = meta.get("id", rid_default)
                 summary = meta.get("summary", "")
                 if not msg or msg.startswith("misra violation"):
-                    msg = summary or f"MISRA C:2012 Rule {m.group(1)} violation"
+                    msg = summary or f"MISRA C:2012 {kind} {m.group(2)} violation"
                 findings.append(Finding(
                     rule_id=rid, standard="MISRA-C:2012",
                     severity=meta.get("severity", sev), file=rel, line=line, column=col,
@@ -159,16 +228,3 @@ class CppcheckAnalyzer(Analyzer):
                     analyzer=self.name, line_content=line_content, context_symbol=ctx_symbol,
                 ))
         return findings
-
-    @staticmethod
-    def _line_of(root: Path, fpath: str, line: int) -> tuple[str, str]:
-        try:
-            p = Path(fpath)
-            if not p.is_absolute():
-                p = root / fpath
-            lines = p.read_text("utf-8", errors="replace").splitlines()
-            if 0 < line <= len(lines):
-                return lines[line - 1], enclosing_function(lines, line - 1)
-            return "", ""
-        except OSError:
-            return "", ""

@@ -53,12 +53,46 @@ def _warn_coverage(result: dict) -> None:
     warning = result.get("coverage_warning")
     if warning:
         print(f"\nWARNING: {warning}\n", file=sys.stderr)
+    elif result.get("analyzer_errors"):
+        # verify()/scan results always carry coverage_warning when analyzers
+        # failed; this is the belt-and-braces path for any other caller.
+        for e in result["analyzer_errors"]:
+            print(f"\nWARNING: {e['analyzer']} {e['status']}: {e['error']}\n", file=sys.stderr)
+
+
+def _scan_options(args) -> dict:
+    """Shared scan-option flags -> engine keyword arguments."""
+    return {"include_paths": args.include,
+            "exclude": args.exclude,
+            "default_excludes": not args.no_default_excludes,
+            "std": args.std,
+            "compiler_flags": args.compiler_flag,
+            "compile_commands": args.compile_commands}
+
+
+def _add_scan_options(s) -> None:
+    s.add_argument("--include", "-I", action="append",
+                   help="Include dir forwarded to cppcheck/clang-tidy/the compiler as -I "
+                        "(repeatable). Without these, headers outside the "
+                        "scanned paths cause misconfiguration false positives.")
+    s.add_argument("--exclude", action="append",
+                   help="fnmatch pattern of directories/files to skip when walking a "
+                        "directory (repeatable), e.g. third_party or 'gen/*'. Added to "
+                        "the defaults (.git, .maishac, build, dist, node_modules, ...).")
+    s.add_argument("--no-default-excludes", action="store_true",
+                   help="Do not skip the default directories (.git, build, node_modules, ...).")
+    s.add_argument("--std", help="C standard for the compiler/clang-tidy checks (default c11).")
+    s.add_argument("--compiler-flag", action="append", metavar="FLAG",
+                   help="Extra compiler flag, e.g. -DNDEBUG or -Iinc (repeatable; only "
+                        "-D/-U/-I/-isystem/-iquote/-std= and a few target flags are accepted).")
+    s.add_argument("--compile-commands", metavar="FILE",
+                   help="compile_commands.json to take per-file -D/-I/-std flags from.")
 
 
 def cmd_scan(args):
     eng = _engine(args)
     result = eng.scan(args.paths, args.analyzers.split(",") if args.analyzers else None,
-                      include_paths=args.include)
+                      **_scan_options(args))
     _print(result)
     _warn_coverage(result)
 
@@ -131,13 +165,15 @@ def cmd_session(args):
             "max_iterations": args.max_iterations, "batch_size": args.batch_size,
             "verification_policy": args.verification_policy,
             "test_command": args.test_command,
-            "include_paths": args.include}, force=args.force)
+            **_scan_options(args)}, force=args.force)
         _print(out)
         _warn_coverage(out)
     elif args.action == "batch":
         _print(eng.next_batch(args.session_id))
     elif args.action == "verify":
-        _print(eng.verify(args.session_id))
+        out = eng.verify(args.session_id)
+        _print(out)
+        _warn_coverage(out)
     elif args.action == "status":
         _print(eng.session_status(args.session_id))
 
@@ -251,11 +287,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("scan", help="Scan paths and sync memory")
     s.add_argument("paths", nargs="+")
-    s.add_argument("--analyzers", help="Comma list: native,cppcheck,clang-tidy")
-    s.add_argument("--include", "-I", action="append",
-                   help="Include dir forwarded to cppcheck/clang-tidy as -I "
-                        "(repeatable). Without these, headers outside the "
-                        "scanned paths cause misconfiguration false positives.")
+    s.add_argument("--analyzers", help="Comma list: native,cppcheck,clang-tidy,compiler")
+    _add_scan_options(s)
     s.set_defaults(fn=cmd_scan)
 
     s = sub.add_parser("findings", help="List open findings")
@@ -308,10 +341,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Shell command that must exit 0 to confirm fixes (e.g. 'make test').")
     s.add_argument("--force", action="store_true",
                    help="Start a new session even if one is already active on this project.")
-    s.add_argument("--include", "-I", action="append",
-                   help="Include dir forwarded to cppcheck/clang-tidy as -I "
-                        "(repeatable). Without these, headers outside the "
-                        "scanned paths cause misconfiguration false positives.")
+    _add_scan_options(s)
     s.set_defaults(fn=cmd_session)
 
     s = sub.add_parser("approve", help="Approve a pending_verification finding as resolved")

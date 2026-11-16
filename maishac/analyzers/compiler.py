@@ -16,8 +16,9 @@ import re
 import shutil
 from pathlib import Path
 
-from .base import Analyzer
-from ..model import Finding, enclosing_function, relpath
+from .base import (AnalysisResult, Analyzer, SourceLines, _tail, load_compile_commands,
+                   parallel_map, validate_compiler_flags)
+from ..model import Finding, relpath
 from ..rules import REGISTRY
 
 # gcc/clang `-Wflag` -> registry rule (fuzzy id). Only clear, defensible
@@ -41,6 +42,12 @@ _DIAG = re.compile(
     # the line:col separator (same care as the clang-tidy adapter).
     r"^(?P<file>.+?):(?P<line>\d+):(?P<col>\d+):\s+(?P<sev>warning|error):\s+"
     r"(?P<msg>.*?)\s+\[-W(?P<flag>[\w=+-]+)\]\s*$", re.MULTILINE)
+
+# Any error-level diagnostic, with or without a [-Wflag] suffix. A plain
+# `error:` / `fatal error:` (missing header, syntax error) means the file did
+# not compile, so the absence of warnings for it says nothing.
+_ERROR = re.compile(r"^(?P<file>.+?):(?P<line>\d+):(?:\d+:)?\s+(?:fatal )?error:\s+(?P<msg>.*?)"
+                    r"(?:\s+\[-W[\w=+-]+\])?\s*$", re.MULTILINE)
 
 
 class CompilerAnalyzer(Analyzer):
@@ -69,37 +76,78 @@ class CompilerAnalyzer(Analyzer):
         except Exception:  # noqa: BLE001 — a missing/odd compiler must not break the GEP
             return cc
 
-    def analyze(self, files: list[Path], root: Path,
-                include_paths: list[str] | None = None) -> list[Finding]:
+    def run(self, files: list[Path], root: Path,
+            include_paths: list[str] | None = None,
+            options: dict | None = None) -> AnalysisResult:
+        res = AnalysisResult(self.name)
         cc = self._compiler()
         if not cc:
-            return []
+            res.status = "failed"
+            res.error = "no C compiler (gcc, clang or cc) found on PATH"
+            res.failed_files = [relpath(f, root) for f in files if f.suffix == ".c"]
+            return res
         c_files = [f for f in files if f.suffix == ".c"]
+        res.skipped_files = [relpath(f, root) for f in files if f.suffix != ".c"]
         if not c_files:
-            return []
+            return res
+        opts = options or {}
         include_flags = [f"-I{p}" for p in (include_paths or [])]
+        std = opts.get("std") or "c11"
+        extra = validate_compiler_flags(opts.get("compiler_flags"))
+        per_file: dict[str, list[str]] = {}
+        if opts.get("compile_commands"):
+            per_file = load_compile_commands(opts["compile_commands"], root)
+        src = SourceLines(root)
+
         # -fsyntax-only: warn without producing objects or linking. Compile each
         # file on its own so one file's fatal error (a missing header) can't
         # suppress warnings from the others.
-        findings: list[Finding] = []
-        for f in c_files:
-            cmd = [cc, "-fsyntax-only", "-std=c11", "-Wall", "-Wextra"] \
-                + include_flags + [str(f)]
+        def one(f: Path):
+            flags = per_file.get(str(f.resolve()))
+            cmd = [cc, "-fsyntax-only", f"-std={std}", "-Wall", "-Wextra"] \
+                + include_flags + (flags if flags is not None else []) + extra + [str(f)]
             try:
                 proc = self._run(cmd, timeout=120)
-            except Exception:  # noqa: BLE001 — degrade to no findings on launch failure
-                continue
-            findings.extend(self._parse(proc.stdout + "\n" + proc.stderr, root))
-        return findings
+            except Exception as e:  # noqa: BLE001 — a compiler that did not run proves nothing
+                return f, [], f"{cc} did not run on {relpath(f, root)}: {type(e).__name__}: {e}"
+            text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            found = self._parse(text, root, src)
+            err = next(iter(_ERROR.finditer(text)), None)
+            # An error that carries a [-Wflag] is a promoted warning (e.g.
+            # -Werror=...): the file was still analyzed. Anything else is a
+            # compile failure.
+            hard = next((m for m in _ERROR.finditer(text)
+                         if not re.search(r"\[-W[\w=+-]+\]\s*$", m.group(0))), None)
+            if hard is not None:
+                return f, found, (f"{cc} could not compile {relpath(f, root)}: "
+                                  f"{hard.group('msg')} (line {hard.group('line')})")
+            rc = getattr(proc, "returncode", 0) or 0
+            if rc != 0 and err is None:
+                return f, found, (f"{cc} exited {rc} on {relpath(f, root)}: "
+                                  + (_tail(text) or "no output"))
+            return f, found, ""
 
-    def _parse(self, text: str, root: Path) -> list[Finding]:
+        for f, found, err in parallel_map(one, c_files):
+            res.findings.extend(found)
+            rel = relpath(f, root)
+            if err:
+                res.failed_files.append(rel)
+                res.error = res.error or err
+            else:
+                res.analyzed_files.append(rel)
+        if res.failed_files:
+            res.status = "partial" if res.analyzed_files else "failed"
+        return res
+
+    def _parse(self, text: str, root: Path, src: SourceLines | None = None) -> list[Finding]:
+        src = src or SourceLines(root)
         findings: list[Finding] = []
         for m in _DIAG.finditer(text):
             flag = m.group("flag").split("=", 1)[0]  # -Wformat=2 -> format
             fpath = m.group("file")
             rel = relpath(fpath, root)
             line = int(m.group("line"))
-            line_content, ctx = self._line_of(root, fpath, line)
+            line_content, ctx = src.line_of(fpath, line)
             ref = WFLAG_TO_RULE.get(flag)
             meta = REGISTRY.resolve(ref) if ref else None
             if meta:
@@ -119,16 +167,3 @@ class CompilerAnalyzer(Analyzer):
                     message=m.group("msg"), analyzer=self.name,
                     line_content=line_content, context_symbol=ctx))
         return findings
-
-    @staticmethod
-    def _line_of(root: Path, fpath: str, line: int) -> tuple[str, str]:
-        try:
-            p = Path(fpath)
-            if not p.is_absolute():
-                p = root / fpath
-            lines = p.read_text("utf-8", errors="replace").splitlines()
-            if 0 < line <= len(lines):
-                return lines[line - 1], enclosing_function(lines, line - 1)
-            return "", ""
-        except OSError:
-            return "", ""

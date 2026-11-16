@@ -190,6 +190,23 @@ def toolchain_warning(status: dict) -> str:
     return "\n".join(L)
 
 
+def analyzer_failure_warning(errors: list[dict]) -> str:
+    """Human-readable account of analyzers that failed or only partly worked
+    in a scan, or ''. Distinct from toolchain_warning: that one is about tools
+    that are not installed, this one about tools that ran and did not deliver."""
+    if not errors:
+        return ""
+    L = ["Analysis incomplete: findings from the analyzers below are NOT reliable "
+         "for this run, and nothing they previously reported was marked resolved."]
+    for e in errors:
+        n = e.get("files_not_analyzed", 0)
+        what = "failed" if e.get("status") == "failed" else "partly failed"
+        L.append(f"  - {e['analyzer']} {what} ({n} file(s) not analyzed): {e.get('error', '')}")
+    L.append("A clean result here does NOT mean the code is compliant. Fix the "
+             "analyzer problem (missing headers need -I include paths) and rescan.")
+    return "\n".join(L)
+
+
 def enforced_ids(standard: str | None = None) -> set[str]:
     native = native_ids()
     return {r for r in REGISTRY.all_ids(standard)

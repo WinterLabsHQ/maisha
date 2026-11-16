@@ -51,18 +51,32 @@ def _j(obj) -> str:
 # ------------------------------------------------------------------ scanning
 @mcp.tool()
 def compliance_scan(paths: list[str], analyzers: list[str] | None = None,
-                    include_paths: list[str] | None = None) -> str:
+                    include_paths: list[str] | None = None,
+                    exclude: list[str] | None = None,
+                    std: str | None = None,
+                    compiler_flags: list[str] | None = None,
+                    compile_commands: str | None = None) -> str:
     """Scan C files/directories for MISRA C, BARR-C and CERT C violations and
     sync results into persistent project memory.
 
     Args:
         paths: Files or directories, relative to the project root (e.g. ["src"]).
-        analyzers: Optional subset of ["native", "cppcheck", "clang-tidy"].
+        analyzers: Optional subset of ["native", "cppcheck", "clang-tidy", "compiler"].
             Default: every analyzer installed on this machine.
-        include_paths: Header search dirs forwarded to cppcheck/clang-tidy as -I.
-            Without these, headers outside `paths` (e.g. a project's config.h)
-            are invisible to those analyzers and they misreport "undefined
-            identifier"/"file not found" false positives instead of real defects.
+        include_paths: Header search dirs forwarded to cppcheck/clang-tidy/the
+            compiler as -I. Without these, headers outside `paths` (e.g. a
+            project's config.h) are invisible to those analyzers and they
+            misreport "undefined identifier"/"file not found" false positives
+            (or fail to compile the file at all) instead of finding real defects.
+        exclude: Extra fnmatch patterns of directories/files to skip when a
+            directory is walked (e.g. ["third_party", "gen/*"]). Always skipped:
+            .git, .maishac, build, dist, node_modules, .venv and similar.
+        std: C standard for the compiler/clang-tidy checks (default "c11").
+        compiler_flags: Extra -D/-U/-I/-isystem/-iquote/-std= flags (attached
+            values, e.g. "-DNDEBUG") for the compiling analyzers. Other flags are
+            rejected.
+        compile_commands: Path to a compile_commands.json to take per-file
+            flags from (relative to the project root).
 
     Returns JSON with counts and a memory diff (new/persisting/resolved/
     regressed/suppressed/deviated). Use compliance_list_findings to see details.
@@ -74,8 +88,16 @@ def compliance_scan(paths: list[str], analyzers: list[str] | None = None,
     relay it to the user and must not describe a clean or converged scan as
     "compliant"; the unchecked rules were never examined. Call
     compliance_doctor for the full picture.
+
+    ALSO CHECK `analyzer_errors` (and `analysis_complete`). An analyzer that
+    crashed, timed out, or could not compile a file reports nothing for it, which
+    looks exactly like "no violations". Maisha never marks findings resolved on
+    the strength of such a run, but you must tell the user which analyzer failed
+    and must not present the scan as clean.
     """
-    return _j(_engine().scan(paths, analyzers, include_paths=include_paths))
+    return _j(_engine().scan(paths, analyzers, include_paths=include_paths,
+                             exclude=exclude, std=std, compiler_flags=compiler_flags,
+                             compile_commands=compile_commands))
 
 
 @mcp.tool()
@@ -207,7 +229,11 @@ def compliance_begin_session(paths: list[str], max_iterations: int = 10,
                              verification_policy: str | None = None,
                              test_command: str | None = None,
                              force: bool = False,
-                             include_paths: list[str] | None = None) -> str:
+                             include_paths: list[str] | None = None,
+                             exclude: list[str] | None = None,
+                             std: str | None = None,
+                             compiler_flags: list[str] | None = None,
+                             compile_commands: str | None = None) -> str:
     """Start an engineered fix session: runs a baseline scan and opens a loop
     with budgets, stall detection and oscillation guards.
 
@@ -232,13 +258,17 @@ def compliance_begin_session(paths: list[str], max_iterations: int = 10,
             on every scan/verify in this session. Without these, headers outside
             `paths` are invisible to those analyzers and they misreport
             "undefined identifier"/"file not found" false positives.
+        exclude, std, compiler_flags, compile_commands: Same as compliance_scan;
+            applied on every scan/verify in this session.
 
     Follow with compliance_next_batch.
     """
     return _j(_engine().begin_session(paths, {
         "max_iterations": max_iterations, "batch_size": batch_size,
         "severity_floor": severity_floor, "verification_policy": verification_policy,
-        "test_command": test_command, "include_paths": include_paths}, force=force))
+        "test_command": test_command, "include_paths": include_paths,
+        "exclude": exclude, "std": std, "compiler_flags": compiler_flags,
+        "compile_commands": compile_commands}, force=force))
 
 
 @mcp.tool()
@@ -274,7 +304,13 @@ def compliance_record_attempt(session_id: str, fingerprint: str,
 def compliance_verify(session_id: str) -> str:
     """Re-scan after your edits, grade every pending fix attempt, detect
     regressions, and decide the loop state: active | converged |
-    budget_exhausted | stalled. Call after each editing round.
+    awaiting_verification | analysis_incomplete | budget_exhausted | stalled.
+    Call after each editing round.
+
+    `analysis_incomplete` means an analyzer failed or could not analyze some
+    files (see `analyzer_errors`): a clean result is not trusted, nothing is
+    resolved on its account, and the session cannot converge. Tell the user
+    what failed, fix the cause (usually missing include paths) and verify again.
 
     Args:
         session_id: Active session id.

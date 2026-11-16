@@ -10,8 +10,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .base import Analyzer
-from ..model import Finding, enclosing_function, relpath
+from .base import AnalysisResult, Analyzer, SourceLines, _tail, parallel_map
+from ..model import Finding, relpath
 from ..rules import REGISTRY
 
 _DIAG = re.compile(
@@ -63,31 +63,76 @@ class ClangTidyAnalyzer(Analyzer):
     requires = "clang-tidy"
     options = "--checks=-*,cert-*,bugprone-*,clang-analyzer-* (CERT C checks)"
 
-    def analyze(self, files: list[Path], root: Path,
-                include_paths: list[str] | None = None) -> list[Finding]:
+    def run(self, files: list[Path], root: Path,
+            include_paths: list[str] | None = None,
+            options: dict | None = None) -> AnalysisResult:
+        res = AnalysisResult(self.name)
         if not files:
-            return []
+            return res
         c_files = [f for f in files if f.suffix == ".c"]
+        # Headers are not translation units. They are covered only through the
+        # .c files that include them, and diagnostics inside headers are
+        # switched off below (--header-filter=^$), so clang-tidy never claims
+        # to have analyzed (or cleared findings in) a header.
+        res.skipped_files = [relpath(f, root) for f in files if f.suffix != ".c"]
         if not c_files:
-            return []
+            return res
+        opts = options or {}
         # Without include dirs, clang-tidy can't find project headers ("file not
         # found") and never parses the file at all — see BENCHMARKS.md.
         include_flags = [f"-I{p}" for p in (include_paths or [])]
-        cmd = ["clang-tidy", "--quiet",
-               "--checks=-*,cert-*,bugprone-*,clang-analyzer-*"] \
-              + [str(f) for f in c_files] + ["--", "-std=c11"] + include_flags
-        try:
-            proc = self._run(cmd, timeout=600)
-        except Exception:
-            return []
+        std = opts.get("std") or "c11"
+        extra = list(opts.get("compiler_flags") or [])
+        src = SourceLines(root)
+
+        def one(f: Path):
+            # One invocation per file: when several files share a run,
+            # clang-tidy's "Error while processing" marker is not reliable per
+            # file, and a failed translation unit must be attributable.
+            cmd = ["clang-tidy", "--quiet", "--header-filter=^$",
+                   "--checks=-*,cert-*,bugprone-*,clang-analyzer-*", str(f),
+                   "--", f"-std={std}"] + include_flags + extra
+            try:
+                proc = self._run(cmd, timeout=600)
+            except Exception as e:  # noqa: BLE001 — a tool that did not run proves nothing
+                return f, [], f"clang-tidy did not run on {relpath(f, root)}: {type(e).__name__}: {e}"
+            out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            found = self._parse(out, root, src)
+            rc = getattr(proc, "returncode", 0) or 0
+            errored = any(m.group("sev") == "error" for m in _DIAG.finditer(out)) \
+                or "Error while processing" in out
+            if errored:
+                first = next((m for m in _DIAG.finditer(out) if m.group("sev") == "error"), None)
+                why = (f"{first.group('msg')} [{first.group('check')}]" if first
+                       else _tail(proc.stderr or ""))
+                return f, found, f"clang-tidy could not fully analyze {relpath(f, root)}: {why}"
+            if rc != 0 and not found:
+                return f, found, (f"clang-tidy exited {rc} on {relpath(f, root)}: "
+                                  + (_tail(out) or "no output"))
+            return f, found, ""
+
+        for f, found, err in parallel_map(one, c_files):
+            res.findings.extend(found)
+            rel = relpath(f, root)
+            if err:
+                res.failed_files.append(rel)
+                res.error = res.error or err
+            else:
+                res.analyzed_files.append(rel)
+        if res.failed_files:
+            res.status = "partial" if res.analyzed_files else "failed"
+        return res
+
+    def _parse(self, text: str, root: Path, src: SourceLines | None = None) -> list[Finding]:
+        src = src or SourceLines(root)
         findings = []
-        for m in _DIAG.finditer(proc.stdout + "\n" + proc.stderr):
+        for m in _DIAG.finditer(text):
             check = m.group("check")
             cm = _CERT_CHECK.search(check)
             fpath = m.group("file")
             rel = relpath(fpath, root)
             line = int(m.group("line"))
-            line_content, ctx_symbol = self._line_of(root, fpath, line)
+            line_content, ctx_symbol = src.line_of(fpath, line)
             if cm:
                 meta = REGISTRY.resolve(f"CERT {cm.group(1).upper()}-C") or {}
                 rid = meta.get("id", f"CERT {cm.group(1).upper()}-C")
@@ -108,16 +153,3 @@ class ClangTidyAnalyzer(Analyzer):
                     line_content=line_content, context_symbol=ctx_symbol,
                 ))
         return findings
-
-    @staticmethod
-    def _line_of(root: Path, fpath: str, line: int) -> tuple[str, str]:
-        try:
-            p = Path(fpath)
-            if not p.is_absolute():
-                p = root / fpath
-            lines = p.read_text("utf-8", errors="replace").splitlines()
-            if 0 < line <= len(lines):
-                return lines[line - 1], enclosing_function(lines, line - 1)
-            return "", ""
-        except OSError:
-            return "", ""

@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
-  status TEXT NOT NULL DEFAULT 'active',   -- active|converged|budget_exhausted|aborted
+  status TEXT NOT NULL DEFAULT 'active',   -- active|converged|budget_exhausted|aborted|stalled|awaiting_verification|analysis_incomplete
   iteration INTEGER NOT NULL DEFAULT 0,
   config TEXT,
   history TEXT,          -- JSON list of iteration snapshots (open counts per iteration)
@@ -167,7 +167,8 @@ class MemoryStore:
 
     # ------------------------------------------------------------ scan sync
     def sync_scan(self, findings: list[Finding], scanned_files: list[str],
-                  gate: bool = False, producers: set[str] | None = None) -> dict:
+                  gate: bool = False, producers: set[str] | None = None,
+                  analyzed: dict[str, set[str]] | None = None) -> dict:
         """Reconcile a fresh scan against memory.
 
         Returns a diff: {new, persisting, resolved, pending, regressed, suppressed,
@@ -184,6 +185,14 @@ class MemoryStore:
         absent from the scan is only cleared if one of *its* producers ran —
         so a native rescan never resolves findings imported from a qualified
         engine via SARIF. None = clear any absent finding (legacy behavior).
+
+        ``analyzed`` is the stricter, per-file form: analyzer name -> the files
+        it actually analyzed this run (a failed analyzer maps to an empty set).
+        When given it replaces ``producers``. An absent finding is cleared only
+        if at least one of its producers that took part in this run analyzed
+        its file, and none of the producers that took part failed to analyze
+        it. A crashed tool, a timeout or a file that did not compile therefore
+        never resolves anything.
         """
         now = time.time()
         current = {f.fingerprint: f for f in findings}
@@ -234,7 +243,13 @@ class MemoryStore:
         for fp, prev in known.items():
             if fp in current:
                 continue
-            if producers is not None and not any(
+            if analyzed is not None:
+                took_part = [a for a in (prev["analyzer"] or "").split("+") if a in analyzed]
+                if not took_part:
+                    continue  # none of its analyzers ran — can't judge it cleared
+                if any(prev["file"] not in analyzed[a] for a in took_part):
+                    continue  # one of them failed on this file — can't judge it cleared
+            elif producers is not None and not any(
                     a in producers for a in (prev["analyzer"] or "").split("+")):
                 continue  # this finding's analyzer didn't run — can't judge it cleared
             if prev["status"] in ("open", "regressed") and prev["file"] in scanned:
