@@ -5,9 +5,15 @@ All notable changes to Maisha are documented here. Format loosely follows
 
 ## [Unreleased]
 
-### Behaviour changes for existing users
+## [0.5.0] - 2026-11-16
 
-Read these before upgrading; each is also listed under Added/Changed/Fixed/Security below.
+### Upgrade notes
+
+Read these before upgrading; each is also listed under Security/Added/Fixed/Changed below.
+
+- **Back up `.maishac/memory.db` first.** The memory schema is now v5 and migrates in place on the
+  first open of an existing database. Downgrading afterwards is not supported, so keep a copy
+  (`cp .maishac/memory.db .maishac/memory.db.bak`) if you may need to go back.
 
 - **Report verdict wording changed.** `COMPLIANT` / `COMPLIANT WITH DEVIATIONS` is no longer
   reachable in practice. Reports say `NOT ASSESSED` (no scan recorded) or `NO VIOLATIONS FOUND IN
@@ -43,6 +49,14 @@ Read these before upgrading; each is also listed under Added/Changed/Fixed/Secur
 - **MCP path confinement:** paths outside the project root are rejected unless
   `MAISHAC_ALLOW_OUTSIDE_PROJECT=1`.
 - **Memory schema is now v5** and migrates in place on first open. Downgrading afterwards is not supported.
+  Where the v5 path normalization merges two rows for the same identical-line finding, the surviving
+  row keeps the strongest suppression and approval, all fix attempts and any pending proposals.
+- **Mandatory-rule waivers stop working.** MISRA Mandatory guidelines can no longer be suppressed or
+  deviated (also through SARIF import, and after GRP re-categorization). Suppressions, deviations and
+  permits that already exist on Mandatory rules are ignored at the next scan, so those findings
+  reappear as open. Fix them; there is no waiver path.
+- **Waivers on schema 3/4 databases** whose origin cannot be proven human (no `cli` audit entry) are
+  relabelled `legacy` on upgrade, like pre-v3 ones.
 - **MCP scans are always gated.** An MCP-originated `compliance_scan`, `compliance_import_sarif` or
   session `verify` sends findings the analyzer no longer reports to `pending_verification`, never
   straight to `resolved`. `compliance_begin_session(verification_policy="analyzer_only")` is rejected
@@ -84,6 +98,17 @@ Read these before upgrading; each is also listed under Added/Changed/Fixed/Secur
 
 ### Added
 
+- **Trust hardening against an agent with a shell** (SECURITY.md has the limits): `maishac proposals
+  accept` needs a TTY and the typed proposal id, or `--yes` with `MAISHAC_HUMAN=1` and a matching
+  `MAISHAC_CONFIRM_TOKEN` registered with `maishac proposals set-token`. Accepts audit-log the OS
+  user, TTY state and method. Test-command changes are hashed, audit-logged (`test_command_change`),
+  shown in `maishac doctor` and flagged in reports when they differ from the session's.
+- **`.github/dependabot.yml`** for GitHub Actions and pip (weekly, grouped). Pinned action SHAs were
+  refreshed to the latest releases; `pypa/gh-action-pypi-publish` is pinned to a release tag commit.
+- **Tests for the workflows, Dockerfile and docs:** `tests/test_workflows.py` (tag check, job wiring,
+  SHA pins, least-privilege permissions, docker dispatch guard), `tests/test_dockerfile.py`,
+  `tests/test_docs_commands.py` (every `maishac` subcommand and flag in README, INSTALL and
+  AGENT_PLAYBOOK exists in the CLI). `pyyaml` joins the `dev` extra.
 - **Native MISRA C:2012 Rule 15.2** (goto must jump forward). Labels and gotos are scoped to the
   function frame (multi-line signatures supported) and resolved when the function closes. On the
   littlefs, lwip, mbedtls and zephyr corpora: 199 hits, 0 false positives (VALIDATION.md 4.1). The
@@ -141,6 +166,18 @@ Read these before upgrading; each is also listed under Added/Changed/Fixed/Secur
   recategorizations, `approval_source` on findings, `proposals` and `audit_log` tables.
 
 ### Fixed
+- A CLI-created `analyzer_only` session verified over MCP is forced to the human gate; it now ends in
+  `awaiting_verification` with a reason that says so and a `next` hint pointing to `maishac approve`
+  (the reason was empty).
+- Cross-analyzer occurrence alignment now handles two tools that disagree by a line on a repeated
+  violating line (multi-line statements): reports within one line cluster as one violation, and only a
+  truly ambiguous group falls back to per-analyzer numbering.
+- The v5 migration no longer caps occurrence recovery at 64 and stays linear on large databases.
+- Native banned-call check: a definition with its return type alone on the previous line
+  (`void` / `free(void *p)`) is no longer reported as a call.
+- Docs: SECURITY.md supported-versions table (was 0.1.0), the README and INSTALL GitHub Actions
+  examples now set `permissions: security-events: write` and use `upload-sarif@v4`.
+- The Windows process-tree kill of the test-command runner is injectable and unit-tested.
 - `verify` and `abort` write the session status as a compare-and-set: a slow `verify` can no longer
   overwrite a session aborted (or verified) meanwhile; it returns an error and records nothing.
 - `begin_session` is blocked by a session in `awaiting_verification` or `analysis_incomplete`, not only
@@ -193,6 +230,8 @@ Read these before upgrading; each is also listed under Added/Changed/Fixed/Secur
   before, so existing fingerprints stay valid).
 
 ### Changed
+- **Packaging:** SPDX `license = "MIT"` with `license-files` and `setuptools>=77` (the deprecated
+  `{text = ...}` form and the License classifier are gone); `pytest` collects `tests/` only.
 - The MISRA C:2012 guideline total shown in reports is the documented, approximate constant
   `MISRA_C_2012_APPROX_GUIDELINES` (roughly 175) and README/COVERAGE.md say "roughly 175" instead of
   "180+" (the two disagreed).

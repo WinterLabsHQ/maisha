@@ -166,10 +166,10 @@ maishac doctor
 ```
 
 ```
-maishac 0.4.0 at /home/you/firmware
+maishac 0.5.0 at /home/you/firmware
 
 Analyzers
-  [ ok ] analyzer: native: maishac 0.4.0
+  [ ok ] analyzer: native: maishac 0.5.0
   [ ok ] analyzer: cppcheck: Cppcheck 2.17.1
   [ ok ] cppcheck MISRA addon: MISRA addon responds
   [warn] analyzer: clang-tidy: not installed (needs clang-tidy on PATH)
