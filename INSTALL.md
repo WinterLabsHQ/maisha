@@ -42,13 +42,24 @@ dependencies:
 pipx install maishac          # recommended if you have pipx
 ```
 
+**Using an editor or agent (MCP)?** The MCP server is an optional extra, so
+install it with:
+
+```bash
+pipx install 'maishac[mcp]'   # or: pip install 'maishac[mcp]'
+```
+
+The CLI (`scan`, `gate`, `report`, sessions) works without it; `maishac serve`
+prints this install hint if the extra is missing. The extra is limited to
+`mcp>=1.2.0,<2`: mcp 2.x removed the module Maisha's server imports.
+
 <details>
 <summary>From source (for contributing, or to get unreleased changes)</summary>
 
 ```bash
 git clone https://github.com/WinterLabsHQ/maisha.git
 cd maisha
-pip install -e ".[dev]"
+pip install -e ".[dev,mcp]"
 python -m pytest tests/ -q
 ```
 </details>
@@ -66,6 +77,17 @@ docker run --rm -v "$PWD:/work" ghcr.io/winterlabshq/maisha doctor
 
 `-v "$PWD:/work"` mounts your project; the container works in `/work`. Nothing
 is uploaded anywhere — the container runs entirely on your machine.
+
+The image also contains gcc (for the `compiler` analyzer) and includes the `[mcp]`
+extra. It runs as an unprivileged user (uid/gid 1000), and Maisha writes its
+memory to `<project>/.maishac/`, so the mounted directory must be writable by that
+user. If your host uid is not 1000, run with your own ids:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/winterlabshq/maisha scan src/
+```
+
+A read-only mount (`:ro`) cannot record findings; scan a writable copy instead.
 </details>
 
 At this point Maisha works, but only with its built-in checks. Keep going.

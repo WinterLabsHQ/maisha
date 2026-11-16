@@ -5,6 +5,38 @@ All notable changes to Maisha are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Behaviour changes for existing users
+
+Read these before upgrading; each is also listed under Added/Changed/Fixed/Security below.
+
+- **Report verdict wording changed.** `COMPLIANT` / `COMPLIANT WITH DEVIATIONS` is no longer
+  reachable in practice. Reports say `NOT ASSESSED` (no scan recorded) or `NO VIOLATIONS FOUND IN
+  CHECKED GUIDELINES (N unchecked)`, and guidelines no analyzer checked are `Not checked`. Scripts
+  that match the old strings need updating. After upgrading, run one scan to record a baseline.
+- **MCP approvals become proposals.** `compliance_approve_finding`, `compliance_add_deviation`,
+  `compliance_recategorize` and `compliance_suppress_finding` no longer take effect until a person
+  runs `maishac proposals accept`. `MAISHAC_ALLOW_AGENT_APPROVALS=1` restores the old behaviour (unsafe).
+- **`test_command` removed from the MCP `compliance_begin_session`.** Configure it with
+  `--test-command`, `MAISHAC_TEST_COMMAND` or `.maishac/config.json`; it runs without a shell and the
+  default timeout is 600 s (was 1800 s).
+- **CLI errors exit 1** with `error: ...` on stderr instead of a traceback. A scan that finds no
+  files is an error, not `converged`.
+- **Scan exit codes:** `scan` still exits 0 unless `--fail-on` (or `gate`) is given. With it, exit 1
+  means findings and exit 2 means a degraded analysis (missing/failed analyzer) unless `--allow-degraded`.
+  A pipeline that previously relied on `gate` semantics must pass `--allow-degraded` to keep passing
+  without cppcheck/clang-tidy installed.
+- **Import gating is the default.** Re-importing a newer SARIF file from the same tool resolves the
+  findings that are gone from it, into `pending_verification` (so a person still confirms with
+  `maishac approve`). Findings from other tools are untouched. `LoopEngine.import_sarif(gate=False)`
+  keeps the ungated behaviour for library users.
+- **`REGISTRY.resolve()` is exact.** `deviate "21"` or `deviate "misra"` now fail instead of binding to
+  a rule; `MISRA Dir 4.1` no longer resolves to Rule 4.1.
+- **`mcp` is an optional extra.** `pip install maishac` no longer installs it; use
+  `pip install 'maishac[mcp]'` (pinned `mcp>=1.2.0,<2`) for `maishac serve`.
+- **MCP path confinement:** paths outside the project root are rejected unless
+  `MAISHAC_ALLOW_OUTSIDE_PROJECT=1`.
+- **Memory schema is now v4** and migrates in place on first open. Downgrading afterwards is not supported.
+
 ### Security
 - **An MCP agent can no longer approve its own work.** `compliance_approve_finding`,
   `compliance_add_deviation`, `compliance_recategorize` and
@@ -23,6 +55,31 @@ All notable changes to Maisha are documented here. Format loosely follows
   the next scan.
 
 ### Added
+- **Honest analysis outcomes.** Every analyzer returns an explicit per-run result
+  (`Analyzer.run()` -> `AnalysisResult`; `analyze()` stays as a findings-only wrapper). A crashed,
+  timed-out or missing analyzer no longer makes its findings look fixed: `sync_scan` only closes
+  findings in files an analyzer actually analyzed. Scan/verify return `analyzer_errors`,
+  `analysis_complete` and `coverage_warning`; the CLI prints them on stderr. New non-terminal session state
+  `analysis_incomplete` (becomes `budget_exhausted` when the budget is spent). cppcheck without its MISRA
+  addon is a partial run that claims no file.
+- **`scans` table** recording what each scan, verify and import ran (paths, files, analyzers used and
+  failed, tool versions, degraded flag, Maisha version). Every report shows a "last scan" block. Import
+  rows are provenance only.
+- **`Not checked` status and honest verdicts** in `misra_compliance_summary`, the compliance matrix
+  (`rules_in_kb`, `rules_detectable`, `clean_among_checked`, `analysis_recorded`, `analysis_degraded`) and the
+  Guideline Enforcement Plan (`checked_by` lists only mapped analyzers, `(not installed)` when absent;
+  reference-only guidelines read "Not enforced by tooling - requires separate method"). Expired deviation
+  permits no longer count.
+- **Scan options:** `--exclude` / `--no-default-excludes` (default excludes: `.git`, `.maishac`, `build`,
+  `dist`, `node_modules`, `.venv`, ...), `--std`, `--compiler-flag` (closed allowlist, because MCP agents can set
+  it), `--compile-commands`; MCP `exclude`. The compiler adapter runs in a small thread pool.
+- **Packaging and CI:** CI matrix (Python 3.10-3.12 on Linux; Windows and macOS as experimental
+  non-blocking entries), ruff job, a run without the `mcp` extra, and a `build` + `twine check` job that
+  verifies the wheel ships `maishac/rules/*.json` (`tools/check_dist.py`). `release.yml` and
+  `docker-publish.yml` run the tests first and refuse a tag that differs from `v{__version__}`. Third-party
+  actions are pinned to commit SHAs. The Docker image installs gcc and the `[mcp]` extra and runs as a non-root user (uid
+  1000; see the Dockerfile for volume permissions).
+- `pyproject.toml` has a minimal `[tool.ruff]` baseline (pyflakes + core pycodestyle errors).
 - **CI gate.** `maishac scan --fail-on <blocker|critical|major|minor|info|any|none>` (and
   the alias `maishac gate`, default `any`) exits 1 when open findings are at or above the
   threshold, and 2 when the analysis was degraded (an analyzer failed, or a recommended
@@ -50,6 +107,15 @@ All notable changes to Maisha are documented here. Format loosely follows
   recategorizations, `approval_source` on findings, `proposals` and `audit_log` tables.
 
 ### Fixed
+- **A failing analyzer no longer reads as a fix** (see Added: honest analysis outcomes), and plumbing
+  bugs behind it: a shared `_line_of` source cache, cppcheck `misra-c2012-dir-N` ids now map to
+  `MISRA-C:2012 Dir N`, cppcheck gets `--file-list` instead of a huge argv, and clang-tidy runs once per file with
+  `--header-filter=^$` (header diagnostics are never reported; headers are `skipped_files`).
+- **SARIF export:** uses the real Maisha version (was hard-coded), exports suppressed/deviated findings with
+  `suppressions`, includes the persisted `column`, and keeps pending findings out of the results.
+- **Single-sourced version.** `__version__` in `maishac/__init__.py` is the only place; `pyproject.toml` reads it
+  dynamically. `CITATION.cff` (was 0.3.2), the README badge and the INSTALL sample output are
+  aligned and covered by `tests/test_version_consistency.py`. `VALIDATION.md` carries a historical note.
 - **Native banned-call false positives.** Member access (`obj->free(x)`, `ops.system()`),
   declarations/definitions of a banned name (`char *strcpy(char *, const char *);`) and
   the macro being defined (`#define free(p) ...`) no longer count as calls to the library
@@ -84,6 +150,12 @@ All notable changes to Maisha are documented here. Format loosely follows
   before, so existing fingerprints stay valid).
 
 ### Changed
+- The MISRA C:2012 guideline total shown in reports is the documented, approximate constant
+  `MISRA_C_2012_APPROX_GUIDELINES` (roughly 175) and README/COVERAGE.md say "roughly 175" instead of
+  "180+" (the two disagreed).
+- Documentation pass: README (scope, CI exit codes, report statuses, session states, audit log, upgrade notes),
+  INSTALL, CLAUDE.md, CONTRIBUTING, AGENT_PLAYBOOK, AUTHORING_PLAYBOOK and integrations/.
+  `.maishac/config.json` is documented as human-controlled only if the agent cannot write to the project dir.
 - `coverage.native_ids()` reads an explicit `NATIVE_RULES` registry in `maishac/analyzers/native.py`
   instead of regex-scanning the analyzer's source. The analyzer raises if a check reports a rule
   that is not registered, and a test compares the registry with the queries in the source.

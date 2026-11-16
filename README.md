@@ -105,7 +105,8 @@ authoritative wording you still need the official MISRA / BARR / SEI CERT docume
   analysis tool *itself* to be qualified or proven-in-use; Maisha does not
   meet that bar and does not claim to.
 - **Not complete rule coverage.** 214 curated rules across three standards is a
-  fraction of MISRA C:2012 (roughly 175 rules/directives with amendments; the exact count depends on the amendments adopted) or CERT C.
+  fraction of MISRA C:2012 (roughly 175 rules/directives with amendments; the
+  figure is approximate and depends on the amendments adopted) or CERT C.
   Of those, 107 are *enforced* (some analyzer detects them) and 107 are
   *reference* entries carried for cross-standard equivalence, deviation records
   and SARIF import — they are not something Maisha finds for you.
@@ -120,6 +121,14 @@ authoritative wording you still need the official MISRA / BARR / SEI CERT docume
   ground-truthed fixtures, a full fix-loop simulation, SARIF import, CLI
   end-to-end and edge-case tests — is in
   [BENCHMARK-SUITE-REPORT.md](BENCHMARK-SUITE-REPORT.md).
+- **Reports say what was not checked.** A guideline no analyzer examined in the
+  last recorded scan is reported as **`Not checked`**, never as compliant. The
+  verdict is `NOT ASSESSED` before any scan and otherwise reads `NO VIOLATIONS
+  FOUND IN CHECKED GUIDELINES (N unchecked)`; plain `COMPLIANT` is only reachable
+  when nothing is unchecked, which in practice means never. An analyzer that
+  crashes, times out or is not installed is a failed *analysis*, not a clean
+  one: its findings are not closed, and the scan reports `analyzer_errors` and
+  a `coverage_warning`. See [Reading the reports](#reading-the-reports).
 - **Not a substitute for human review.** By default a fix is never marked
   `resolved` on a clean rescan alone — a passing test run or an explicit human
   approval is required, and semantic-risk / high-severity findings *always*
@@ -169,6 +178,16 @@ pip install maishac
 This installs the `maishac` CLI and the `maishac` Python package. Verify with
 `maishac --help`.
 
+The MCP server is an **optional extra** (scan, gate, reports and sessions need no
+third-party packages). To run `maishac serve`, install it with:
+
+```bash
+pipx install 'maishac[mcp]'      # or: pip install 'maishac[mcp]'
+```
+
+The extra pins `mcp>=1.2.0,<2` (mcp 2.x removed the `FastMCP` module Maisha uses).
+Without it, `maishac serve` exits with that install hint.
+
 **Or run it as a container** (batteries included — cppcheck's MISRA addon and
 clang-tidy are baked in, so no host setup):
 
@@ -182,7 +201,7 @@ To hack on Maisha itself:
 ```bash
 git clone https://github.com/WinterLabsHQ/maisha.git
 cd maisha
-pip install -e ".[dev]"   # editable install with pytest
+pip install -e ".[dev,mcp]"   # editable install with pytest + the MCP server
 ```
 
 Optional but strongly recommended external analyzers — native works with
@@ -328,6 +347,84 @@ Design principles:
 4. **Compliance is a process, not a scan.** Deviations and suppressions are
    first-class, auditable records — exactly as MISRA compliance expects.
 
+## CI gate and exit codes
+
+`maishac scan` exits 0 by default, whatever it finds. To fail a pipeline, ask for it:
+
+```bash
+maishac scan src/ --fail-on major     # blocker|critical|major|minor|info|any|none
+maishac gate src/                     # alias of: scan --fail-on any
+maishac scan src/ --fail-on any --allow-degraded
+```
+
+| Exit | Meaning |
+|---|---|
+| 0 | No open finding at or above the threshold, and the analysis was complete |
+| 1 | Open findings at or above `--fail-on` (also: any CLI error such as an unknown session id, a bad argument or a zero-file scan) |
+| 2 | The analysis was **degraded** (an analyzer failed, or a recommended one is not installed) and `--allow-degraded` was not given |
+
+Findings take precedence over degradation (exit 1 beats 2). A degraded pass is
+not a pass: a clean result from a scan that never ran cppcheck says nothing about
+the rules cppcheck covers. Pass `--allow-degraded` only where that is a deliberate
+choice. The scan JSON carries `open_by_severity` and, with the flag, a `gate` block.
+
+## Reading the reports
+
+`compliance_report` / `maishac report`, the Guideline Compliance Summary
+(`misra_compliance_summary`) and the Guideline Enforcement Plan are built from
+recorded evidence, including *which analyzers actually succeeded in the last
+scan* (stored in the `scans` table, with their versions).
+
+| Status / verdict | Meaning |
+|---|---|
+| `Violations` / `Deviations` / `Compliant` / `Disapplied` | Checked in the last scan, with that outcome. A deviation permit that has **expired** no longer counts; the finding is a violation again |
+| `Not checked` | No analyzer that maps to this guideline succeeded in the last recorded scan (or no scan was recorded, or the guideline is reference-only). It says nothing about the code. A not-checked Mandatory guideline is not blocking |
+| `NOT ASSESSED` | No scan has been recorded |
+| `NO VIOLATIONS FOUND IN CHECKED GUIDELINES (N unchecked)` | The only favourable verdict. Appended with `; last scan degraded or incomplete` and/or `WITH DEVIATIONS` when applicable |
+| `NON-COMPLIANT` / `PENDING` | Open violations (or a Mandatory violation or deviation) / fixes recorded but not yet verified |
+
+The Guideline Enforcement Plan's `checked_by` lists only analyzers that map the
+guideline, with `(not installed)` when absent. Reference-only guidelines read
+*"Not enforced by tooling - requires separate method"*. The compliance matrix
+reports `rules_in_kb`, `rules_detectable` and `clean_among_checked`; `clean` is
+strict (every rule detectable and a non-degraded recorded scan).
+`report --format sarif` uses the real Maisha version, exports suppressed and
+deviated findings with SARIF `suppressions`, and includes the column.
+
+## Sessions: states and the audit log
+
+A session ends in one of these states:
+
+| State | Meaning |
+|---|---|
+| `active` | In progress |
+| `awaiting_verification` | Fixes are pending a test run or human sign-off |
+| `converged` | Nothing open in scope (imported findings do not block) |
+| `stalled` / `budget_exhausted` | No progress over the stall window / iteration budget spent |
+| `needs_human` | Every remaining finding is frozen by the oscillation guard |
+| `analysis_incomplete` | The re-scan could not run every analyzer, so "nothing left" cannot be concluded. Not terminal: fix the toolchain and `session verify` again (becomes `budget_exhausted` if the budget is spent) |
+| `aborted` | Ended on purpose with `maishac session abort <id>` / `compliance_abort_session` |
+
+Ended sessions refuse `next_batch`, `verify` and `record_attempt`. `verify`
+respects the session's `--severity-floor` and paths; findings outside are
+reported as `open_out_of_scope`. An open imported finding is reported as
+`open_imported` and named in the reason.
+
+Every approval, suppression, deviation, re-categorization, revocation,
+proposal decision and session start/end is written to an append-only `audit_log`
+(`maishac audit [--json] [--action ...]`, and an audit section in the report).
+Actions made by an MCP agent are marked `[AGENT]`. Nothing in the MCP surface
+can revoke: `maishac unsuppress`, `revoke-deviation` and `uncategorize` are
+CLI-only.
+
+## Upgrading an existing project
+
+`.maishac/memory.db` migrates in place the first time the new version opens it
+(`PRAGMA user_version`, currently 4); no action is needed and old fingerprints
+stay valid. A scan recorded by an older version has no `scans` row, so reports
+show `NOT ASSESSED` / `Not checked` until you run one new scan. See the
+CHANGELOG for behaviour changes.
+
 ## The verification gate
 
 The trap Maisha guards against: the only judge of a fix is the same analyzer
@@ -409,6 +506,12 @@ a shell**; write `sh -c 'a && b'` if you need pipes or `&&`. The default timeout
 is 600 s (`--test-timeout`, `MAISHAC_TEST_TIMEOUT`); on timeout the whole process
 group is killed.
 
+> `.maishac/config.json` is only human-controlled if the agent **cannot write to
+> the project directory**. An agent with file-write access can edit that file
+> (and the `.maishac/` database) directly. If that matters, run the agent in a
+> sandbox that makes `.maishac/` read-only, or set the command with the flag or
+> the environment variable instead.
+
 ## Teams & concurrency
 
 Project memory lives in a per-project SQLite file, `.maishac/memory.db`.
@@ -424,7 +527,7 @@ Project memory lives in a per-project SQLite file, `.maishac/memory.db`.
 ## Development
 
 ```bash
-pip install -e . && python -m pytest tests/ -q
+pip install -e ".[dev,mcp]" && python -m pytest tests/ -q   # MCP tests skip if the mcp extra is absent
 ```
 
 `examples/bad.c` is a deliberately non-compliant fixture exercising ~18 rules —

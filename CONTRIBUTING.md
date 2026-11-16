@@ -10,8 +10,8 @@ patterns, or analyzer adapters. This guide shows you where.
 ```bash
 git clone https://github.com/WinterLabsHQ/maisha.git
 cd maisha
-pip install -e ".[dev]"        # editable install + pytest
-python -m pytest -q            # 44 tests, should be green before you start
+pip install -e ".[dev,mcp]"    # editable install + pytest + MCP server (optional extra)
+python -m pytest -q            # should be green before you start; MCP tests skip without the extra
 ```
 
 `python` may not be on your PATH — use `python3`. Optional analyzers
@@ -20,7 +20,7 @@ analyzer runs with zero dependencies and the suite passes without them.
 
 ## Before you open a PR
 
-- Run `python -m pytest -q` — all tests must pass.
+- Run `python -m pytest -q` — all tests must pass — and `ruff check .` (CI runs both).
 - If you touched the rule registry, run `python tools/gen_coverage.py` to
   regenerate `COVERAGE.md` (a test fails if it drifts).
 - Keep the diff focused; one concern per PR.
@@ -123,9 +123,14 @@ Every id in `rules` must resolve in the registry (a test enforces it), and
 ### 3. An analyzer adapter (a new evidence source)
 
 To wire in another tool (a linter, compiler warnings, another engine), subclass
-`Analyzer` in `maishac/analyzers/base.py` and return `Finding`s (see
+`Analyzer` in `maishac/analyzers/base.py`, implement `run()` returning an
+`AnalysisResult` (findings plus an explicit outcome: which files were analyzed and
+whether the tool failed; a crash or timeout must never look like "no findings"),
+and return `Finding`s (see
 `native.py`, `cppcheck.py`, `clang_tidy.py` for examples). Map the tool's rule
-ids onto the registry with `REGISTRY.resolve(...)`. Register it in
+ids onto the registry with `REGISTRY.resolve(...)` (exact match; it no longer
+falls back to substring search). A new native check must also add its rule to
+`NATIVE_RULES` in `analyzers/native.py`. Register it in
 `analyzers/__init__.py::run_scan`. It should degrade gracefully when the tool
 isn't installed.
 
