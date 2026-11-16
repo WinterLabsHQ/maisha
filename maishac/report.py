@@ -282,6 +282,27 @@ def _read_line(path: Path, line: int) -> str:
         return ""
 
 
+def test_command_info(mem: MemoryStore) -> dict:
+    """The project's current test command (hash, source, config.json mtime) and how
+    it compares with the one the latest session started with. A command given as a
+    CLI flag is session-local, so only env/config.json sessions are compared."""
+    from . import trust
+    cur = trust.test_command_state(mem.root)
+    sess = mem.latest_session()
+    scfg = (sess or {}).get("config", {})
+    s_sha = scfg.get("test_command_sha256", "")
+    s_src = scfg.get("test_command_source")
+    differs = bool(sess and "test_command_sha256" in scfg and s_src != "cli"
+                   and s_sha != cur["sha256"])
+    last = mem.last_audit("test_command_change")
+    return {"configured": cur["configured"], "sha256": cur["sha256"], "source": cur["source"],
+            "config_mtime": cur["config_mtime"],
+            "session_id": sess["id"] if sess else None,
+            "session_sha256": s_sha, "session_source": s_src,
+            "differs_from_session": differs,
+            "last_change_ts": last["ts"] if last else None}
+
+
 def last_scan_info(mem: MemoryStore) -> dict:
     """What the most recent analysis run did, for every report that draws a
     conclusion. `recorded` False means no scan/verify was ever logged, so
@@ -293,7 +314,7 @@ def last_scan_info(mem: MemoryStore) -> dict:
     info = {"recorded": last is not None, "degraded": None, "ts": None, "kind": None,
             "paths": [], "files_scanned": 0, "analyzers_used": [],
             "analyzers_failed": [], "checked_analyzers": [], "versions": {},
-            "maishac_version": None,
+            "maishac_version": None, "test_command": test_command_info(mem),
             "last_import": ({"ts": imp["ts"], "sources": imp["paths"], "tools": imp["analyzers_used"]}
                             if imp else None)}
     if last:
@@ -332,6 +353,22 @@ def _last_scan_lines(info: dict) -> list[str]:
     if info["degraded"]:
         L.append("- **The last scan ran with a degraded toolchain** (missing or "
                  "deselected analyzers, or an analyzer failure).")
+    tc = info.get("test_command")
+    if tc:
+        if tc["configured"]:
+            L.append(f"- Test command: sha256 `{tc['sha256'][:12]}` from {tc['source']}"
+                     + (f", config.json modified {_fmt_ts(tc['config_mtime'])}"
+                        if tc["config_mtime"] else "")
+                     + (f", last changed {_fmt_ts(tc['last_change_ts'])}"
+                        if tc["last_change_ts"] else ""))
+        else:
+            L.append("- Test command: none configured")
+        if tc["differs_from_session"]:
+            L.append(f"- **WARNING: the test command now configured differs from the one "
+                     f"session {tc['session_id']} started with** "
+                     f"(then `{(tc['session_sha256'] or 'none')[:12]}`, now "
+                     f"`{(tc['sha256'] or 'none')[:12]}`). Fixes confirmed by tests in that "
+                     "session may have been judged by a different command; review it.")
     if info["last_import"]:
         L.append(f"- Last SARIF import: {_fmt_ts(info['last_import']['ts'])} "
                  f"({', '.join(info['last_import']['tools']) or 'no results'})")

@@ -346,6 +346,9 @@ on: [pull_request]
 jobs:
   maisha:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # required by upload-sarif
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -355,7 +358,7 @@ jobs:
       - run: maishac scan src/ --include include/ --fail-on major
       - run: maishac report --format sarif > maisha.sarif
         if: always()
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@v4
         if: always()
         with: { sarif_file: maisha.sarif }
 ```
@@ -389,7 +392,7 @@ The default is `test_gated` if a test command is configured, else `human_gated`.
 
 | Rule | Detail |
 |---|---|
-| MCP sign-offs are proposals | `compliance_approve_finding`, `compliance_add_deviation`, `compliance_recategorize` and `compliance_suppress_finding` create a proposal (`pending_human`). Nothing changes until a person runs `maishac proposals accept <id> --by <who>` (or `reject <id> --by <who> -r "why"`). The accepting person is recorded as approver. |
+| MCP sign-offs are proposals | `compliance_approve_finding`, `compliance_add_deviation`, `compliance_recategorize` and `compliance_suppress_finding` create a proposal (`pending_human`). Nothing changes until a person runs `maishac proposals accept <id> --by <who>` in a terminal and types the proposal id to confirm (or `reject <id> --by <who> -r "why"`). The accepting person is recorded as approver, with OS user and TTY state in the audit log. Scripts without a TTY need `--yes`, `MAISHAC_HUMAN=1` and `MAISHAC_CONFIRM_TOKEN` matching the token a person registered with `maishac proposals set-token`. |
 | Over MCP, scans are gated | `analyzer_only` is refused, so an agent cannot resolve findings by editing code and rescanning. |
 | Opt-out exists, and is unsafe | `MAISHAC_ALLOW_AGENT_APPROVALS=1` in the server's environment makes those tools act directly. The agent then grades its own work. Entries are stored with `source=mcp`, marked `[AGENT-ORIGINATED]` and flagged in reports. |
 | Mandatory rules are protected | MISRA Mandatory guidelines (judged after GRP re-categorization) can never be suppressed or deviated, in any mode. |
@@ -435,8 +438,8 @@ With cppcheck missing, `maishac scan` prints a coverage warning instead of imply
 
 ```console
 $ maishac scan bad.c
-WARNING: Reduced coverage: 56/107 detectable rules active (52%).
-  - cppcheck not installed (cppcheck): 51 rule(s) unchecked, e.g. CERT ARR30-C, CERT ARR32-C, CERT DCL30-C
+WARNING: Reduced coverage: 57/107 detectable rules active (53%).
+  - cppcheck not installed (cppcheck): 50 rule(s) unchecked, e.g. CERT ARR30-C, CERT ARR32-C, CERT DCL30-C
 A clean result here does NOT mean the code is compliant with the rules above - they were never checked. ...
 
 $ maishac gate bad.c > /dev/null; echo $?
@@ -454,7 +457,7 @@ The three rule knowledge bases hold **214 rules** with original paraphrased summ
 | CERT C | 122 | 34 | 88 |
 | **Total** | **214** | **107** | **107** |
 
-*Reference* entries are carried for cross-standard equivalence, deviation records and SARIF import. Maisha does not find them for you. On a machine with only the zero-dependency tools, `maishac doctor` reports how many enforced rules are reachable (56 of 107 with native, clang-tidy and gcc; installing cppcheck raises that). Every covered rule and the analyzer behind it is listed in [COVERAGE.md](COVERAGE.md), generated from the code so gaps are explicit.
+*Reference* entries are carried for cross-standard equivalence, deviation records and SARIF import. Maisha does not find them for you. On a machine with only the zero-dependency tools, `maishac doctor` reports how many enforced rules are reachable (57 of 107 with native, clang-tidy and gcc; installing cppcheck raises that). Every covered rule and the analyzer behind it is listed in [COVERAGE.md](COVERAGE.md), generated from the code so gaps are explicit.
 
 ## 🧭 Scope and limitations
 

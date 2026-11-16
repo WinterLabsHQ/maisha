@@ -20,7 +20,7 @@
     maishac import findings.sarif         ingest an external engine's SARIF
     maishac approve <fingerprint> --by me  human sign-off on a verified fix
     maishac unsuppress <fingerprint> | revoke-deviation <id> | uncategorize "MISRA 15.5"
-    maishac proposals list|accept <id> --by me|reject <id> --by me   agent-proposed sign-offs
+    maishac proposals list|accept <id> --by me|reject <id> --by me|set-token   agent-proposed sign-offs (accept asks for confirmation)
     maishac audit [--limit N] [--json]    append-only history of every sign-off
     maishac serve                         run the MCP server (stdio)
 """
@@ -284,6 +284,25 @@ def cmd_unsuppress(args):
     _emit(eng.unsuppress(args.fingerprint, args.by, args.reason))
 
 
+def _set_confirm_token() -> None:
+    import getpass
+    from . import trust
+    if not trust._is_tty():
+        print("set-token needs an interactive terminal.", file=sys.stderr)
+        sys.exit(1)
+    tok = getpass.getpass("New confirm token (min 8 chars, not shown): ")
+    if getpass.getpass("Repeat it: ") != tok:
+        print("Tokens differ; nothing stored.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        path = trust.set_confirm_token(tok)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    print(f"Stored a salted hash in {path}. Non-interactive accepts need --yes, "
+          f"{trust.HUMAN_ENV}=1 and {trust.TOKEN_ENV}=<token>.")
+
+
 def cmd_proposals(args):
     eng = _engine(args)
     if args.action == "list":
@@ -297,11 +316,23 @@ def cmd_proposals(args):
             for r in rows:
                 print(f"{r['id']}  [{r['status']}] {r['kind']:<12} {r['summary']}")
         return
+    if args.action == "set-token":
+        _set_confirm_token()
+        return
     if not args.id:
         print(f"proposals {args.action} needs a proposal id.", file=sys.stderr)
         sys.exit(1)
     if args.action == "accept":
-        _emit(eng.accept_proposal(args.id, args.by or ""))
+        from . import trust
+        prop = eng.mem.get_proposal(args.id)
+        if prop and prop["status"] == "pending_human" and (args.by or "").strip():
+            ctx, why = trust.confirm_accept(args.id, prop["summary"], args.yes)
+            if ctx is None:
+                print(why, file=sys.stderr)
+                sys.exit(1)
+        else:
+            ctx = None       # unknown/decided/no --by: the engine reports the error
+        _emit(eng.accept_proposal(args.id, args.by or "", confirmation=ctx))
     else:
         _emit(eng.reject_proposal(args.id, args.by or "", args.reason or ""))
 
@@ -493,8 +524,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("proposals", help="Review sign-offs an MCP agent proposed "
                                          "(approve/deviate/suppress/recategorize)")
-    s.add_argument("action", choices=["list", "accept", "reject"])
+    s.add_argument("action", choices=["list", "accept", "reject", "set-token"])
     s.add_argument("id", nargs="?")
+    s.add_argument("--yes", action="store_true",
+                   help="accept: skip the typed confirmation. Needs MAISHAC_HUMAN=1; without a "
+                        "terminal also needs MAISHAC_CONFIRM_TOKEN (see `proposals set-token`).")
     s.add_argument("--by", help="the human accepting/rejecting (recorded as approver)")
     s.add_argument("--reason", "-r", default="", help="note when rejecting")
     s.add_argument("--all", action="store_true", help="list: include decided proposals")

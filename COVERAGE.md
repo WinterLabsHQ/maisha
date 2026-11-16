@@ -25,7 +25,7 @@ construct, so treat the external columns as an upper bound. `**not
 detected**` means no engine we know of covers the rule: the entry is
 carried for cross-referencing, deviation records and SARIF import.
 
-## MISRA-C:2012 — 72 rules (31 detected with zero dependencies)
+## MISRA-C:2012 — 72 rules (32 detected with zero dependencies)
 
 | Rule | Category | Severity | Detected by | Summary |
 |------|----------|----------|-------------|---------|
@@ -49,7 +49,7 @@ carried for cross-referencing, deviation records and SARIF import.
 | MISRA-C:2012 Rule 10.1 | required | critical | cppcheck | Operands shall have an appropriate essential type for the operator. |
 | MISRA-C:2012 Rule 11.3 | required | critical | cppcheck | A pointer to one object type shall not be cast to a pointer to a different object type. |
 | MISRA-C:2012 Rule 14.4 | required | critical | cppcheck | Controlling expressions of if/while shall have essentially Boolean type. |
-| MISRA-C:2012 Rule 15.2 | required | critical | cppcheck | A goto must jump forward, never to a label earlier in the function. |
+| MISRA-C:2012 Rule 15.2 | required | critical | native, cppcheck | A goto must jump forward, never to a label earlier in the function. |
 | MISRA-C:2012 Rule 15.3 | required | critical | cppcheck | A goto's target label must be declared in the same block as the goto, or in a block enclosing it. |
 | MISRA-C:2012 Rule 15.6 | required | critical | native, cppcheck | Bodies of if/else/loop statements shall be compound (brace-enclosed) blocks. |
 | MISRA-C:2012 Rule 15.7 | required | critical | cppcheck | An if / else-if chain must be terminated with a final else clause. |

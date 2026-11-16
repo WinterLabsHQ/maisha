@@ -10,9 +10,13 @@ patterns, or analyzer adapters. This guide shows you where.
 ```bash
 git clone https://github.com/WinterLabsHQ/maisha.git
 cd maisha
-pip install -e ".[dev,mcp]"    # editable install + pytest + MCP server (optional extra)
+pip install -e ".[dev,mcp]"    # editable install + pytest, hypothesis, jsonschema, pyyaml + MCP server (optional extra)
 python -m pytest -q            # should be green before you start; MCP tests skip without the extra
 ```
+
+`pytest` is configured to collect only `tests/` (`testpaths`), so the benchmark
+corpora cloned by `benchmark/corpora/CLONE.sh` are never picked up. The workflow
+tests (`tests/test_workflows.py`) need `pyyaml` (part of `dev`) and skip without it.
 
 `python` may not be on your PATH — use `python3`. Optional analyzers
 (`cppcheck`, `clang-tidy`) increase coverage but are never required: the native
@@ -41,7 +45,7 @@ suite first:
 | Rule | Corpus findings | The shape that was missed |
 |---|---:|---|
 | 20.1 | 927 | continuation lines of a multi-line `#define` counted as code |
-| 15.2 | 423 | `goto cleanup;` resolved against another function's label |
+| 15.2 | 423 | `goto cleanup;` resolved against another function's label (re-implemented on function frames, 0 false positives in 199 hits, see VALIDATION.md 4.1) |
 | 16.3 | 452 | `#endif` between clauses read as the clause's last statement |
 | 20.11 | 109 | `a ## NAME ## b` matched via the 2nd char of the first paste |
 | 17.4 | 69 | returns hidden inside macros (`MBEDTLS_MPS_TRACE_RETURN`) |

@@ -218,6 +218,43 @@ than treating them as defects. "critical+" folds in the few blocker findings.
   take-away for adopters matches the README: set a severity floor and your own
   style config, and pass include paths, before reading raw counts.
 
+### 4.1 Rule 15.2 (goto must jump forward) on the corpora
+
+Rule 15.2 was withdrawn from the native analyzer after 423 wrong findings on
+mbedtls (`goto cleanup;` resolved against another function's label). It is
+re-implemented on per-function frames from `_function_definitions` (multi-line
+signatures supported): labels and gotos are collected on the current frame and
+compared when the frame closes. Frames that never close, no frame, labels
+defined twice (both arms of an `#if`) and gotos inside macro continuation lines
+report nothing.
+
+Measured with `python tools/fp_check.py --rule 15.2 --show 400` (pinned corpora
+from `benchmark/corpora/CLONE.sh`, .c and .h):
+
+| Corpus | Files | 15.2 hits | True positives | False positives |
+|---|---:|---:|---:|---:|
+| littlefs | 14 | 6 | 6 | 0 |
+| lwip | 480 | 1 | 1 | 0 |
+| mbedtls | 131 | 190 | 190 | 0 |
+| zephyr-kernel | 2372 | 2 | 2 | 0 |
+| **Total** | 2997 | **199** | **199** | **0** |
+
+Triage: all 199 hits were checked. A script confirmed for every hit that the
+nearest preceding `label:` line of the named label lies before the goto with no
+column-0 `}` (function end) in between, and 6 (file, label) groups were read by hand (for
+example `lfs.c` `popped:`/`nextname:`, `lwip` `sockets.c` `again:`, zephyr
+`timer.c` `retry:` and `mmu.c` `out:`). The 199 hits fall in 25 distinct
+(file, label) pairs; most are the `goto usage;` / `goto reset;` retry idiom in
+mbedtls `programs/`, which is a real backward jump. None of the hits is a `goto cleanup;`, the shape that broke the earlier
+version. Caveat: the
+check is textual, so a function whose closing brace is not at column 0 is
+covered by the "no frame" rule rather than by this evidence; recall is not
+measured.
+
+Regression check: the full fp_check sweep (all native rules, 2997 files) before
+and after the change differs only by `15.2: 0 -> 199`. Rule 15.6 (740) and all
+banned-call rules are unchanged.
+
 ---
 
 ## 5. Requirements / invariants → test traceability

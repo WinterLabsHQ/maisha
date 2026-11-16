@@ -44,8 +44,8 @@ Rules of engagement:
 - Regressions in the batch (marked `REGRESSED`) take priority over everything.
 - If the finding is a false positive, call `compliance_suppress_finding` with a
   concrete reason — do not silently skip it. This only records a **proposal**:
-  a human has to accept it (`maishac proposals accept <id> --by <name>`), so the
-  finding stays open until then. Never try to work around that.
+  a human has to accept it at a terminal (`maishac proposals accept <id> --by <name>`), so the
+  finding stays open until then. Never try to work around that: do not run `proposals accept`, set `MAISHAC_HUMAN`, or edit `.maishac/`.
 - If the code is genuinely correct but non-compliant for a documented hardware
   or platform reason, call `compliance_add_deviation` with a real justification
   (≥ 15 chars enforced) and a tight `scope` glob. Deviations are audit records,

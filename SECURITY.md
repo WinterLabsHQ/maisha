@@ -2,15 +2,18 @@
 
 ## Supported Versions
 
-Maisha is pre-1.0 (current release: `0.1.0`) and does not yet maintain
-parallel supported release lines. Security fixes are made against `main` and
-shipped in the next release.
+Maisha is pre-1.0 (current release: `0.5.0`) and maintains one supported
+release line. Security fixes are made against `main` and shipped in the next
+release of the latest minor version.
 
 | Version         | Supported          |
-| --------------- | ------------------- |
+| --------------- | ------------------ |
 | `main` (latest) | :white_check_mark: |
-| `0.1.0`         | :white_check_mark: |
-| < `0.1.0`       | :x:                 |
+| `0.5.x`         | :white_check_mark: |
+| < `0.5.0`       | :x:                |
+
+Releases before 0.5.0 lack the provenance tracking and human-accept gate
+described under Scope below. Upgrade rather than wait for a backport.
 
 Once Maisha reaches 1.0, this table will track supported minor lines and this
 policy will be updated accordingly.
@@ -32,17 +35,31 @@ relevant attack surface is local, not network-facing:
   `MAISHAC_ALLOW_AGENT_APPROVALS=1` (unsafe; flagged in reports). MISRA Mandatory
   guidelines can never be suppressed or deviated.
 - **Trust boundary: the MCP surface only.** The sign-off gate assumes the agent can reach Maisha
-  *only* through the MCP tools. An agent with shell access can run `maishac proposals accept` or
-  `maishac approve`, edit `.maishac/config.json` (it sets the test command) or write
-  `.maishac/memory.db` directly, and no check can tell it from a person. Run the agent without
-  shell access to the project, or in a sandbox where those commands and files are out of reach.
-  Under `test_gated`, an agent that can edit the test suite also controls what "passing" means for
-  non-semantic findings; blocker/critical and semantic-risk findings always need a person.
+  *only* through the MCP tools. Run the agent without shell access to the project, or in a sandbox
+  where Maisha, `.maishac/` and your home directory are out of reach.
   MCP-originated scans are always gated (a rescan never resolves a finding by itself) and the
   `analyzer_only` policy is refused over MCP, unless `MAISHAC_ALLOW_AGENT_APPROVALS=1`.
-  A TTY or token check on `accept`/`approve` was considered and not added: any such secret or
-  terminal is also reachable by a process with shell access, so it would suggest a boundary that
-  does not exist.
+  Under `test_gated`, an agent that can edit the test suite also controls what "passing" means for
+  non-semantic findings; blocker/critical and semantic-risk findings always need a person.
+- **Hardening against an agent with a shell (raises the cost, not a boundary).**
+  - `maishac proposals accept` needs a person at a terminal: stdin must be a TTY and the person
+    types the proposal id. Without a TTY it is refused unless `--yes`, `MAISHAC_HUMAN=1` and
+    `MAISHAC_CONFIRM_TOKEN` are all given, and the token matches the salted hash a person
+    registered with `maishac proposals set-token` (stored in `~/.maishac/confirm_token.json`,
+    or `$MAISHAC_USER_DIR`, outside the project). On a TTY, `--yes` with `MAISHAC_HUMAN=1`
+    skips the typed prompt.
+  - The accept is audit-logged with the OS user, TTY or no TTY, confirmation method and time.
+  - The effective test command (`MAISHAC_TEST_COMMAND` or `.maishac/config.json`) is hashed.
+    A change is audit-logged (`test_command_change`: old and new hash, origin, config.json
+    mtime), shown in `maishac doctor`, and sessions record the hash they started with. Reports
+    carry a warning when the command now configured differs from the one the latest session
+    started with.
+- **Out of scope: an agent with arbitrary shell access as the same OS user.** It can edit
+  `.maishac/memory.db` (including the audit log) or `.maishac/config.json` directly, read your
+  environment, set `MAISHAC_HUMAN=1`, drive a pseudo-terminal to answer the prompt, or run the
+  `maishac approve` command. The checks above make that visible and less accidental. They are
+  not a defence, and the audit log is not tamper-proof. The confirm token only helps if the
+  agent cannot read it: do not export `MAISHAC_CONFIRM_TOKEN` in a shell the agent shares.
 - **SARIF import** (`maishac import`, `compliance_import_sarif`) parses
   external JSON/XML. Only import SARIF files from analyzers you trust.
 - **Project memory** (`.maishac/memory.db`) is a local SQLite file with no

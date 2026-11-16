@@ -227,8 +227,40 @@ def _knowledge_base() -> list[dict]:
 
 
 # ----------------------------------------------------------- project memory
+def _test_command_check(root: Path) -> dict:
+    """Show the test command that decides what "tests pass" means, with its hash and
+    the config.json mtime, and warn when it changed since Maisha last recorded it."""
+    import time
+    from . import trust
+    st = trust.test_command_state(root)
+    if not st["configured"]:
+        return _check("test command", OK, "none configured (human_gated verification)")
+    when = (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st["config_mtime"]))
+            if st["config_mtime"] else "n/a")
+    detail = (f"{st['command']} (source: {st['source']}, sha256 {st['sha256'][:12]}, "
+              f"config.json modified {when})")
+    old = None
+    db = root / ".maishac" / "memory.db"
+    if db.exists():
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            row = con.execute("SELECT details FROM audit_log WHERE action='test_command_change'"
+                              " ORDER BY id DESC LIMIT 1").fetchone()
+            con.close()
+            if row and row[0]:
+                import json
+                old = json.loads(row[0]).get("new_sha256")
+        except (sqlite3.Error, ValueError):
+            pass
+    if old is not None and old != st["sha256"]:
+        return _check("test command", WARN, detail,
+                      "Differs from the command Maisha last recorded. If you did not change "
+                      "it, someone else did. It is audit-logged at the next session start.")
+    return _check("test command", OK, detail)
+
+
 def _project(root: Path) -> list[dict]:
-    out = [_check("project root", OK, str(root))]
+    out = [_check("project root", OK, str(root)), _test_command_check(root)]
     mdir = root / ".maishac"
     if not mdir.exists():
         out.append(_check("project memory", WARN, f"{mdir} does not exist yet",

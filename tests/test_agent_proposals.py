@@ -73,22 +73,27 @@ def test_invalid_requests_fail_at_proposal_time(proj):
     assert _human(proj).list_proposals() == []
 
 
-def test_human_accepts_with_cli_and_is_recorded_as_approver(proj, capsys):
+def test_human_accepts_with_cli_and_is_recorded_as_approver(proj, capsys, monkeypatch):
+    from maishac import trust
+    monkeypatch.setenv("MAISHAC_USER_DIR", str(proj / "userdir"))
+    trust.set_confirm_token("s3cret-token")
+    monkeypatch.setenv("MAISHAC_HUMAN", "1")
+    monkeypatch.setenv("MAISHAC_CONFIRM_TOKEN", "s3cret-token")
     fp = _fp(proj)
     pid = json.loads(m.compliance_suppress_finding(fp, LONG_OK))["proposal_id"]
     main(["-p", str(proj), "proposals", "list"])
     assert pid in capsys.readouterr().out
     with pytest.raises(SystemExit):                      # --by is mandatory
-        main(["-p", str(proj), "proposals", "accept", pid])
+        main(["-p", str(proj), "proposals", "accept", pid, "--yes"])
     capsys.readouterr()
-    main(["-p", str(proj), "proposals", "accept", pid, "--by", "lead@example.com"])
+    main(["-p", str(proj), "proposals", "accept", pid, "--yes", "--by", "lead@example.com"])
     mem = _human(proj).mem
     assert mem.is_suppressed(fp)
     sup = mem.suppressions()[0]
     assert sup["approver"] == "lead@example.com" and sup["source"] == "cli"
     assert mem.get_proposal(pid)["status"] == "accepted"
     with pytest.raises(SystemExit):                      # cannot be accepted twice
-        main(["-p", str(proj), "proposals", "accept", pid, "--by", "lead"])
+        main(["-p", str(proj), "proposals", "accept", pid, "--yes", "--by", "lead"])
     actions = [a["action"] for a in mem.audit_entries()]
     assert "propose_suppress" in actions and "proposal_accepted" in actions
 

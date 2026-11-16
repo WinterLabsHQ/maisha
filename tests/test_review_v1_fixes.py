@@ -266,10 +266,10 @@ def test_a_tool_reporting_only_the_second_line_gets_the_second_identity():
     assert lone[0].fingerprint == n[0].fingerprint
 
 
-def test_off_by_one_reports_keep_per_tool_numbering():
+def test_off_by_one_reports_of_one_violation_share_an_identity():
     a, b = [_occ(5, "native")], [_occ(6, "cppcheck")]
     aligned = occurrence_alignment([a, b])
-    assert aligned == {}
+    assert list(aligned.values()) == [{5: 0, 6: 0}]     # see test_followups_a for more
     assert (assign_occurrences(a, aligned)[0].fingerprint
             == assign_occurrences(b, aligned)[0].fingerprint)
 

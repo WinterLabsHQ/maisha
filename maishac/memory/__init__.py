@@ -24,7 +24,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from ..model import Finding, compute_fingerprint
+from ..model import Finding, _normalize_line, compute_fingerprint
 
 
 class MandatoryRuleError(ValueError):
@@ -269,10 +269,44 @@ class MemoryStore:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
         # `scans`, `audit_log` and `proposals` are created by _SCHEMA (CREATE TABLE
         # IF NOT EXISTS), which also runs against old databases.
-        if self.db.execute("PRAGMA user_version").fetchone()[0] < 5:
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if version in (3, 4):
+            self._relabel_unproven_waivers()
+        if version < 5:
             self._normalize_stored_paths()
         if self.db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
             self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def _relabel_unproven_waivers(self) -> None:
+        """Schema 3/4 -> 5 (defence in depth): those versions already had a ``source``
+        column, but MCP tools could still write rows labelled 'cli'. A waiver or
+        approval keeps the 'cli' label only if the audit log has a latest entry for
+        it written by the CLI (a human surface). Anything else is relabelled
+        'legacy', which reports show as ORIGIN UNKNOWN. Never upgrades a label."""
+        def proven(action: str, target: str) -> bool:
+            row = self.db.execute(
+                "SELECT source FROM audit_log WHERE action=? AND target=? "
+                "ORDER BY id DESC LIMIT 1", (action, target)).fetchone()
+            return row is not None and row["source"] == "cli"
+
+        changed: dict[str, int] = {}
+        for table, key, action in (("deviations", "id", "add_deviation"),
+                                   ("suppressions", "fingerprint", "suppress"),
+                                   ("recategorizations", "rule_id", "recategorize")):
+            for r in self.db.execute(f"SELECT {key} AS k FROM {table} WHERE source='cli'").fetchall():
+                if not proven(action, r["k"]):
+                    self.db.execute(f"UPDATE {table} SET source='legacy' WHERE {key}=?", (r["k"],))
+                    changed[table] = changed.get(table, 0) + 1
+        for r in self.db.execute(
+                "SELECT fingerprint FROM findings WHERE approval_source='cli'").fetchall():
+            if not proven("approve_finding", r["fingerprint"]):
+                self.db.execute("UPDATE findings SET approval_source='legacy' WHERE fingerprint=?",
+                                (r["fingerprint"],))
+                changed["approvals"] = changed.get("approvals", 0) + 1
+        if changed:
+            self.audit("provenance_relabel", "", source="engine", commit=False,
+                       details={"label": "legacy", "reason": "origin not proven by the audit log",
+                                "relabelled": changed})
 
     def _normalize_stored_paths(self) -> None:
         """One-time (schema v5): rewrite backslash paths recorded on Windows.
@@ -289,33 +323,94 @@ class MemoryStore:
         dropped in favour of the live one. Each rewrite is audit-logged."""
         rows = self.db.execute(
             "SELECT * FROM findings WHERE file LIKE '%\\%'").fetchall()
+        # Occurrence recovery. A row with occurrence index n implies n sibling rows
+        # (same rule, file, normalized line, function) were recorded in the same scan,
+        # and rows are never deleted, so n < size of the sibling group. Each group's
+        # old-fingerprint -> n table is therefore built once, with a data-derived
+        # bound: linear in the number of rows, not quadratic.
+        groups: dict[tuple, list] = {}
+        for r in rows:
+            key = (r["rule_id"], r["file"], _normalize_line(r["line_content"] or ""),
+                   r["context_symbol"] or "")
+            groups.setdefault(key, []).append(r)
+        recovered: dict[str, int] = {}
+        for (rule, file, content, symbol), members in groups.items():
+            for n in range(len(members)):
+                recovered.setdefault(compute_fingerprint(rule, file, content, symbol, n), n)
         for r in rows:
             old_fp, old_file = r["fingerprint"], r["file"]
             new_file = old_file.replace("\\", "/")
             new_fp = old_fp
-            for n in range(0, 64):
-                if compute_fingerprint(r["rule_id"], old_file, r["line_content"] or "",
-                                       r["context_symbol"] or "", n) == old_fp:
-                    new_fp = compute_fingerprint(r["rule_id"], new_file,
-                                                 r["line_content"] or "",
-                                                 r["context_symbol"] or "", n)
-                    break
+            n = recovered.get(old_fp)
+            if n is not None:
+                new_fp = compute_fingerprint(r["rule_id"], new_file, r["line_content"] or "",
+                                             r["context_symbol"] or "", n)
             if new_fp != old_fp and self.db.execute(
                     "SELECT 1 FROM findings WHERE fingerprint=?", (new_fp,)).fetchone():
-                self.db.execute("DELETE FROM findings WHERE fingerprint=?", (old_fp,))
+                # Duplicate: keep the live row, but carry over everything keyed by the
+                # dropped fingerprint so no suppression, approval or attempt is lost.
+                moved = self._repoint_fingerprint(old_fp, new_fp, drop_row=True)
                 action = "path_migration_dropped_duplicate"
             else:
                 self.db.execute("UPDATE findings SET file=?, fingerprint=? WHERE fingerprint=?",
                                 (new_file, new_fp, old_fp))
-                if new_fp != old_fp:
-                    for table in ("fix_attempts", "suppressions"):
-                        self.db.execute(
-                            f"UPDATE OR IGNORE {table} SET fingerprint=? WHERE fingerprint=?",
-                            (new_fp, old_fp))
+                moved = (self._repoint_fingerprint(old_fp, new_fp, drop_row=False)
+                         if new_fp != old_fp else {})
                 action = "path_migration"
             self.audit(action, new_fp, source="engine", commit=False,
                        details={"from_file": old_file, "to_file": new_file,
-                                "from_fingerprint": old_fp, "to_fingerprint": new_fp})
+                                "from_fingerprint": old_fp, "to_fingerprint": new_fp,
+                                **({"moved": moved} if moved else {})})
+
+    def _repoint_fingerprint(self, old_fp: str, new_fp: str, drop_row: bool) -> dict:
+        """Move everything recorded against ``old_fp`` onto ``new_fp``.
+
+        Fix attempts all move. Suppressions merge keeping the strongest (no expiry
+        beats any expiry, a later expiry beats an earlier one, a tie keeps the
+        surviving row's). When the old finding row is being dropped, its sign-off
+        is copied onto the survivor if the survivor has none. Pending proposals
+        that name the old fingerprint are re-pointed. The audit log is append-only
+        and is not rewritten: the migration's own entry records old -> new.
+        Deviations are scoped by file glob, not fingerprint, so they need no move."""
+        moved: dict[str, int] = {}
+        cur = self.db.execute("UPDATE fix_attempts SET fingerprint=? WHERE fingerprint=?",
+                              (new_fp, old_fp))
+        if cur.rowcount:
+            moved["fix_attempts"] = cur.rowcount
+        old_s = self.db.execute("SELECT * FROM suppressions WHERE fingerprint=?",
+                                (old_fp,)).fetchone()
+        if old_s is not None:
+            new_s = self.db.execute("SELECT * FROM suppressions WHERE fingerprint=?",
+                                    (new_fp,)).fetchone()
+            inf = float("inf")
+            if new_s is None or ((old_s["expires"] or inf) > (new_s["expires"] or inf)):
+                self.db.execute("DELETE FROM suppressions WHERE fingerprint=?", (new_fp,))
+                self.db.execute("UPDATE suppressions SET fingerprint=? WHERE fingerprint=?",
+                                (new_fp, old_fp))
+            else:
+                self.db.execute("DELETE FROM suppressions WHERE fingerprint=?", (old_fp,))
+            moved["suppressions"] = 1
+        if drop_row:
+            old_f = self.db.execute("SELECT * FROM findings WHERE fingerprint=?",
+                                    (old_fp,)).fetchone()
+            new_f = self.db.execute("SELECT * FROM findings WHERE fingerprint=?",
+                                    (new_fp,)).fetchone()
+            if old_f is not None and new_f is not None and old_f["approved_by"] \
+                    and not new_f["approved_by"]:
+                self.db.execute(
+                    "UPDATE findings SET approved_by=?, approved_at=?, approval_source=?,"
+                    " verification_method=COALESCE(verification_method, ?) WHERE fingerprint=?",
+                    (old_f["approved_by"], old_f["approved_at"], old_f["approval_source"],
+                     old_f["verification_method"], new_fp))
+                moved["approval"] = 1
+            self.db.execute("DELETE FROM findings WHERE fingerprint=?", (old_fp,))
+        cur = self.db.execute(
+            "UPDATE proposals SET payload=REPLACE(payload, ?, ?) "
+            "WHERE status='pending_human' AND payload LIKE ?",
+            (f'"{old_fp}"', f'"{new_fp}"', f'%"{old_fp}"%'))
+        if cur.rowcount:
+            moved["proposals"] = cur.rowcount
+        return moved
 
     # ------------------------------------------------------------ scan sync
     def sync_scan(self, findings: list[Finding], scanned_files: list[str],
@@ -671,6 +766,10 @@ class MemoryStore:
         if commit:
             self.db.commit()
 
+    def last_audit(self, action: str) -> Optional[dict]:
+        rows = self.audit_entries(1, action)
+        return rows[0] if rows else None
+
     def audit_entries(self, limit: int = 100, action: str | None = None) -> list[dict]:
         q, args = "SELECT * FROM audit_log", []
         if action:
@@ -960,13 +1059,16 @@ class MemoryStore:
         return [self._proposal_row(r) for r in self.db.execute(q + " ORDER BY ts", args)]
 
     def decide_proposal(self, pid: str, status: str, decided_by: str,
-                        note: str = "", result: dict | None = None) -> None:
+                        note: str = "", result: dict | None = None,
+                        actor_context: dict | None = None) -> None:
         self.db.execute(
             "UPDATE proposals SET status=?, decided_by=?, decided_at=?, decision_note=?, result=?"
             " WHERE id=?", (status, decided_by, time.time(), note,
                             json.dumps(result, default=str) if result is not None else None, pid))
         self.audit(f"proposal_{status}", pid, actor=decided_by, source="cli",
-                   details={"note": note, "result": result}, commit=False)
+                   details={"note": note, "result": result,
+                            **({"actor_context": actor_context} if actor_context else {})},
+                   commit=False)
         self.db.commit()
 
     # ----------------------------------------------------------------- notes
@@ -999,6 +1101,10 @@ class MemoryStore:
                         (sid, json.dumps(config), "[]", now, now))
         self.db.commit()
         return sid
+
+    def latest_session(self) -> Optional[dict]:
+        r = self.db.execute("SELECT id FROM sessions ORDER BY started DESC LIMIT 1").fetchone()
+        return self.get_session(r["id"]) if r else None
 
     def get_session(self, sid: str) -> Optional[dict]:
         r = self.db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()

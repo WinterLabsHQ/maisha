@@ -107,7 +107,7 @@ NATIVE_RULES = frozenset({
     "MISRA Dir 4.4", "MISRA Dir 4.6",
     # MISRA C:2012 rules
     "MISRA 4.2", "MISRA 7.1", "MISRA 7.3", "MISRA 12.5", "MISRA 13.4",
-    "MISRA 13.6", "MISRA 15.1", "MISRA 15.6", "MISRA 16.2", "MISRA 16.4",
+    "MISRA 13.6", "MISRA 15.1", "MISRA 15.2", "MISRA 15.6", "MISRA 16.2", "MISRA 16.4",
     "MISRA 16.5", "MISRA 16.6", "MISRA 17.2", "MISRA 17.6", "MISRA 18.8",
     "MISRA 19.2", "MISRA 20.2", "MISRA 20.3", "MISRA 20.5", "MISRA 20.10",
     "MISRA 20.11", "MISRA 20.13", "MISRA 20.14", "MISRA 21.3", "MISRA 21.4",
@@ -133,9 +133,18 @@ _DEFINE_PREFIX_RE = re.compile(r"^\s*#\s*(?:define|undef)\s+$")
 _CALL_KEYWORDS = frozenset({"return", "else", "do", "case", "goto", "sizeof"})
 
 
-def _is_library_call(line: str, m: "re.Match[str]") -> bool:
+# GNU/BSD style: the return type alone on the line above a definition whose name
+# starts in column 0 (`void\nfree(void *p)`). Both lines must start in column 0,
+# which no statement inside a function body does in this style.
+_BARE_TYPE_LINE_RE = re.compile(r"^[A-Za-z_][\w ]*[\s*]*$")
+
+
+def _is_library_call(line: str, m: "re.Match[str]", prev_line: str = "") -> bool:
     """True when the banned-name match at `m` is a call, not a member or a declaration."""
     prefix = line[:m.start()]
+    if (not prefix and prev_line and _BARE_TYPE_LINE_RE.match(prev_line.rstrip())
+            and not set(re.findall(r"[A-Za-z_]\w*", prev_line)) & (_CALL_KEYWORDS | {"if", "while", "for"})):
+        return False
     if _MEMBER_PREFIX_RE.search(prefix) or _DEFINE_PREFIX_RE.match(prefix):
         return False
     if _DECL_PREFIX_RE.match(prefix):
@@ -149,6 +158,13 @@ _ELSE_NOBRACE_RE = re.compile(r"^\s*else\s+(?!if\b)(?!\{)[^{;\s].*;\s*$")
 _CTRL_HDR_RE = re.compile(r"^\s*(if|else\s+if|for|while)\s*\(.*\)\s*$")
 _ELSE_HDR_RE = re.compile(r"^\s*else\s*$")
 _GOTO_RE = re.compile(r"\bgoto\s+\w+\s*;")
+_GOTO_TARGET_RE = re.compile(r"\bgoto\s+(\w+)\s*;")
+# A statement label: an identifier then a single ':' at the start of a line.
+# `case`/`default` are excluded by keyword, `::` and `?:` by the lookahead and by
+# the caller's check of the previous line.
+_LABEL_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*:(?!:)")
+_NOT_A_LABEL = {"case", "default", "public", "private", "protected", "else",
+                "return", "break", "continue", "do", "sizeof"}
 _UNION_RE = re.compile(r"\bunion\b\s*(\w+)?\s*\{")
 _UNDEF_RE = re.compile(r"^\s*#\s*undef\b")
 _TRIGRAPH_RE = re.compile(r"\?\?[=/'()!<>\-]")
@@ -336,6 +352,18 @@ def _function_definitions(lines: list[str]) -> dict[int, dict]:
                 out[i + 1] = {"name": m.group(1), "sig": text}
         i = j + 1
     return out
+
+
+def _in_ternary(lines: list[str], idx: int) -> bool:
+    """True when the line at idx (0-based) continues a multi-line `a ? b : c`,
+    so a leading `name :` is the false-arm, not a label."""
+    j = idx - 1
+    while j >= 0 and not lines[j].strip():
+        j -= 1
+    if j < 0:
+        return False
+    prev = lines[j].rstrip()
+    return "?" in prev and not prev.endswith((";", "{", "}"))
 
 
 def _array_param_names(decl: str) -> set[str]:
@@ -647,6 +675,18 @@ class NativeAnalyzer(Analyzer):
                     f"macro '{dm.group(1)}': a # operand is immediately followed "
                     "by ##, and their evaluation order is unspecified")
 
+    @staticmethod
+    def _close_function(frame: dict, add) -> None:
+        """Rule 15.2 at function close: a goto whose label does not come later
+        in the same function. A label defined more than once (both arms of an
+        #if/#else) is ambiguous and skipped."""
+        for name, line in frame["gotos"]:
+            defs = frame["labels"].get(name)
+            if defs and len(defs) == 1 and defs[0] <= line:
+                add("MISRA 15.2", line,
+                    f"goto '{name}' jumps back to a label declared earlier "
+                    f"(line {defs[0]}) in '{frame['name']}'")
+
     def _analyze_file(self, f: Path, src: str, root: Path) -> list[Finding]:
         out: list[Finding] = []
         raw_lines = src.splitlines()
@@ -671,7 +711,8 @@ class NativeAnalyzer(Analyzer):
             raw = raw_lines[i - 1] if i <= len(raw_lines) else ""
 
             for m in _CALL_RE.finditer(line):
-                if not _is_library_call(line, m):
+                prev = clean_lines[i - 2] if i >= 2 else ""
+                if not _is_library_call(line, m, prev):
                     continue
                 fn = m.group(1)
                 rule, why = BANNED_CALLS[fn]
@@ -692,16 +733,21 @@ class NativeAnalyzer(Analyzer):
                         and not _CTRL_HDR_RE.match(nxt) and not _ELSE_HDR_RE.match(nxt):
                     add("MISRA 15.6", i,
                         "control statement body is not a compound (braced) block")
-            # Rule 15.2 (a goto must jump forward) is deliberately NOT
-            # implemented. Labels are function-scoped in C, so the rule is only
-            # decidable with reliable function boundaries. Resolving labels
-            # against a file-global table, or against a function frame that
-            # merged with a neighbour, produced hundreds of wrong findings on
-            # mbedtls (`goto cleanup;` resolved to another function's
-            # `cleanup:`), and with no frame the check silently reported nothing,
-            # which reads the same as correct. cppcheck implements 15.2 with a
-            # real parser; the KB carries the rule for that path and for
-            # deviation records.
+            # Rule 15.2: labels are function-scoped, so gotos and labels are
+            # collected on the current function frame and compared when that
+            # frame closes. The frame comes from _function_definitions, which
+            # understands multi-line signatures; with no frame (or one that
+            # never closes) nothing is reported, never a guess against another
+            # function's label.
+            if func_stack:
+                frame = func_stack[-1]
+                lm = _LABEL_RE.match(line)
+                if lm and lm.group(1) not in _NOT_A_LABEL and i not in func_defs \
+                        and not _in_ternary(clean_lines, i - 1):
+                    frame["labels"].setdefault(lm.group(1), []).append(i)
+                if not line.rstrip().endswith("\\"):
+                    for gm in _GOTO_TARGET_RE.finditer(line):
+                        frame["gotos"].append((gm.group(1), i))
             if _GOTO_RE.search(line):
                 add("MISRA 15.1", i, "goto statement")
             if _UNION_RE.search(line):
@@ -772,6 +818,7 @@ class NativeAnalyzer(Analyzer):
                     # Read parameters off the JOINED signature, so an array
                     # parameter declared on a wrapped line is still seen.
                     "array_params": _array_param_names(fdef["sig"]),
+                    "labels": {}, "gotos": [],
                 }
 
             # float equality: crude but effective — == or != on a line mentioning float vars is
@@ -794,7 +841,7 @@ class NativeAnalyzer(Analyzer):
                 func_stack.append(pending_func)
                 pending_func = None
             while func_stack and func_stack[-1]["depth"] > depth:
-                func_stack.pop()
+                self._close_function(func_stack.pop(), add)
             if _SWITCH_RE.search(line):
                 switch_stack.append({"start": i, "depth": depth, "saw_default": False,
                                      "cases": 0, "labels": [], "body_depth": None})

@@ -2,7 +2,7 @@
 
 Usage: python tools/check_dist.py [dist-dir]   (default: dist)
 
-Also, when MAISHAC_TAG is set (e.g. "v0.4.0"), require it to equal
+Also, when MAISHAC_TAG is set (e.g. "v0.5.0"), require it to equal
 "v" + the version of the built wheel, so a release cannot be published from a
 tag that disagrees with maishac.__version__.
 """
