@@ -905,7 +905,9 @@ class LoopEngine:
             return err
         cfg = sess["config"]
         policy = self._policy(cfg)
-        result = self.scan(cfg["paths"], cfg.get("analyzers"), gate=policy != "analyzer_only",
+        want_gate = policy != "analyzer_only"
+        forced_gate = self._effective_gate(want_gate) and not want_gate
+        result = self.scan(cfg["paths"], cfg.get("analyzers"), gate=want_gate,
                            kind="verify", hold_for_human=True, **self._scan_kwargs(cfg))
         if "error" in result:
             return {"session_id": session_id, "state": sess["status"], "error": result["error"]}
@@ -972,6 +974,13 @@ class LoopEngine:
                 need.append("no test_command configured to auto-confirm the rest")
             elif policy == "human_gated":
                 need.append(f"{pending - awaiting_human} more await approval under human_gated policy")
+            if policy == "analyzer_only" and forced_gate:
+                need.append(
+                    f"{pending - awaiting_human} held for a human because the session's "
+                    "policy 'analyzer_only' was forced to gated: this verification came "
+                    "through MCP (agent origin), and an agent may not mark its own fixes "
+                    "resolved by rescanning. A person can run `maishac approve` "
+                    "(a CLI `maishac session verify` does not force the gate)")
             state = "awaiting_verification"
             reason = ("Analyzer-clean, but the fixes are UNVERIFIED — "
                       + "; ".join(need) + ". They do not count as resolved until confirmed.")
@@ -1051,6 +1060,10 @@ class LoopEngine:
                 [f for f in split["in_scope"] if f["status"] == "regressed"]),
             "frozen_needs_human": self._brief_many(frozen_now),
             "next": ("Session complete." if state == "converged"
+                     else ("A person must confirm these fixes from the CLI: run "
+                           "`maishac approve <fingerprint>` (see `maishac findings`), then "
+                           "call session_status.") if state == "awaiting_verification"
+                     and policy == "analyzer_only" and forced_gate
                      else "Approve verified fixes (approve_finding) or call next_batch."
                      if state == "awaiting_verification"
                      else "Fix the analyzer failure (see analyzer_errors) and call verify again."
