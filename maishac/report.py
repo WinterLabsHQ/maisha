@@ -346,6 +346,58 @@ def _expired(d: dict, now: float | None = None) -> bool:
     return bool(d.get("expires")) and d["expires"] < (time.time() if now is None else now)
 
 
+def _mark(row: dict) -> str:
+    """Flag a sign-off that did not come from a person at the CLI."""
+    src = (row.get("source") or row.get("approval_source") or "cli")
+    if src == "mcp":
+        return " **[AGENT-ORIGINATED via MCP]**"
+    if src == "import":
+        return " *[from SARIF import]*"
+    return ""
+
+
+def agent_signoffs(mem: MemoryStore) -> dict:
+    """Every approval, deviation, suppression and re-categorization an MCP agent
+    applied directly (only possible with MAISHAC_ALLOW_AGENT_APPROVALS=1)."""
+    db = mem.db
+    return {
+        "approvals": [dict(r) for r in db.execute(
+            "SELECT fingerprint, rule_id, approved_by FROM findings"
+            " WHERE approval_source='mcp'")],
+        "deviations": [dict(r) for r in db.execute(
+            "SELECT id, rule_id, scope FROM deviations WHERE source='mcp' AND revoked_at IS NULL")],
+        "suppressions": [dict(r) for r in db.execute(
+            "SELECT fingerprint, reason FROM suppressions WHERE source='mcp'")],
+        "recategorizations": [dict(r) for r in db.execute(
+            "SELECT rule_id, to_category FROM recategorizations WHERE source='mcp'")],
+    }
+
+
+def _audit_lines(mem: MemoryStore, limit: int = 15) -> list[str]:
+    rows = mem.audit_entries(limit)
+    pending = mem.proposals()
+    L = ["", "## Audit trail", ""]
+    ag = agent_signoffs(mem)
+    n_agent = sum(len(v) for v in ag.values())
+    if n_agent:
+        L += [f"> **WARNING: {n_agent} sign-off(s) were applied directly by an MCP agent** "
+              "(MAISHAC_ALLOW_AGENT_APPROVALS was enabled), not by a person. They are "
+              "marked below; review them before relying on this report.", ""]
+    if pending:
+        L += [f"{len(pending)} agent proposal(s) are awaiting a human decision "
+              "(`maishac proposals list`).", ""]
+    if not rows:
+        return L + ["No sign-offs recorded."]
+    L += ["| Time | Source | Action | Actor | Target |", "|---|---|---|---|---|"]
+    for r in rows:
+        flag = " **[AGENT]**" if r["source"] == "mcp" else ""
+        L.append(f"| {_fmt_ts(r['ts'])} | {r['source']}{flag} | {r['action']} | "
+                 f"{r['actor'] or '—'} | `{r['target']}` |")
+    L += ["", f"Showing the latest {len(rows)} entries; the full append-only log is "
+              "`maishac audit`."]
+    return L
+
+
 def markdown_report(mem: MemoryStore, project_name: str = "") -> str:
     stats = mem.stats()
     matrix = compliance_matrix(mem)
@@ -393,7 +445,17 @@ def markdown_report(mem: MemoryStore, project_name: str = "") -> str:
         for d in devs:
             lines.append(f"- **{d['rule_id']}** scope `{d['scope']}` — {d['justification']}"
                          f"{(' (approved by ' + d['approver'] + ')') if d['approver'] else ''}"
+                         f"{_mark(d)}"
                          f"{' **[EXPIRED ' + _fmt_ts(d['expires'])[:10] + ']**' if _expired(d) else ''}")
+    supps = mem.suppressions()
+    if supps:
+        lines += ["", "## Suppressions", ""]
+        for sp in supps:
+            exp = (" **[EXPIRED]**" if sp.get("expires") and sp["expires"] < time.time() else "")
+            lines.append(f"- `{sp['fingerprint']}` — {sp['reason']}"
+                         f"{(' (by ' + sp['approver'] + ')') if sp.get('approver') else ''}"
+                         f"{_mark(sp)}{exp}")
+    lines += _audit_lines(mem)
     return "\n".join(lines) + "\n"
 
 
@@ -429,11 +491,13 @@ def _sarif_suppression(mem: MemoryStore, f: dict) -> dict | None:
     kind is "external": both the suppression and the deviation register live in
     Maisha's memory, not in an in-source comment (SARIF kind "inSource")."""
     if f["status"] == "suppressed":
-        r = mem.db.execute("SELECT reason, ts FROM suppressions WHERE fingerprint=?",
-                           (f["fingerprint"],)).fetchone()
+        r = mem.db.execute("SELECT reason, ts, approver, source FROM suppressions"
+                           " WHERE fingerprint=?", (f["fingerprint"],)).fetchone()
         return {"kind": "external", "status": "accepted",
                 "justification": r["reason"] if r else "suppressed in Maisha memory",
-                "properties": {"maishac/origin": "suppression"}}
+                "properties": {"maishac/origin": "suppression",
+                               "maishac/source": (r["source"] if r else "cli"),
+                               "maishac/approver": (r["approver"] if r else "") or ""}}
     if f["status"] == "deviated":
         d = mem.matching_deviation(f["rule_id"], f["file"])
         if not d:
@@ -441,6 +505,7 @@ def _sarif_suppression(mem: MemoryStore, f: dict) -> dict | None:
         return {"kind": "external", "status": "accepted",
                 "justification": d["justification"],
                 "properties": {"maishac/origin": "deviation", "maishac/deviationId": d["id"],
+                               "maishac/source": d.get("source") or "cli",
                                "maishac/approver": d.get("approver") or ""}}
     return None
 
@@ -802,7 +867,7 @@ def misra_compliance_markdown(mem: MemoryStore, project_name: str = "") -> str:
             exp = time.strftime("%Y-%m-%d", time.localtime(d["expires"])) if d.get("expires") else "—"
             if d.get("expired"):
                 exp += " **EXPIRED (not counted)**"
-            appr = d.get("approver") or "**UNAPPROVED**"
+            appr = (d.get("approver") or "**UNAPPROVED**") + _mark(d)
             L.append(f"| {d['rule_id']} | `{d['scope']}` | {d['justification']} | {appr} | {exp} |")
 
     L += ["", "---", "",
@@ -1014,6 +1079,6 @@ def guideline_recategorization_markdown(mem: MemoryStore, project_name: str = ""
     for gid, r in recats.items():
         meta = REGISTRY.get(gid) or {}
         base = meta.get("category", "—")
-        appr = r.get("approver") or "**UNAPPROVED**"
+        appr = (r.get("approver") or "**UNAPPROVED**") + _mark(r)
         L.append(f"| {gid} | {base} | {r['to_category']} | {r['rationale']} | {appr} |")
     return "\n".join(L) + "\n"

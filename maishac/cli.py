@@ -16,6 +16,9 @@
     maishac report [--format markdown|json|sarif|misra-compliance|gep|grp] [-o file]
     maishac import findings.sarif         ingest an external engine's SARIF
     maishac approve <fingerprint> --by me  human sign-off on a verified fix
+    maishac unsuppress <fingerprint> | revoke-deviation <id> | uncategorize "MISRA 15.5"
+    maishac proposals list|accept <id> --by me|reject <id> --by me   agent-proposed sign-offs
+    maishac audit [--limit N] [--json]    append-only history of every sign-off
     maishac serve                         run the MCP server (stdio)
 """
 
@@ -30,7 +33,6 @@ from pathlib import Path
 
 from . import __version__
 from .engine import LoopEngine
-from .memory import MandatoryRuleError
 from .rules import REGISTRY
 from . import report as report_mod
 
@@ -119,13 +121,22 @@ def cmd_guide(args):
     _print(eng.guidance(args.topic, args.limit))
 
 
-def cmd_recategorize(args):
-    eng = _engine(args)
-    out = eng.recategorize(args.rule, args.to, args.rationale, args.approver)
+def _emit(out: dict) -> None:
+    """Print an engine result; an {"error": ...} result is a clean exit 1."""
     if "error" in out:
         print(out["error"], file=sys.stderr)
         sys.exit(1)
     _print(out)
+
+
+def cmd_recategorize(args):
+    eng = _engine(args)
+    _emit(eng.recategorize(args.rule, args.to, args.rationale, args.approver))
+
+
+def cmd_uncategorize(args):
+    eng = _engine(args)
+    _emit(eng.remove_recategorization(args.rule, args.by, args.reason))
 
 
 def cmd_findings(args):
@@ -164,7 +175,7 @@ def cmd_session(args):
         out = eng.begin_session(args.paths, {
             "max_iterations": args.max_iterations, "batch_size": args.batch_size,
             "verification_policy": args.verification_policy,
-            "test_command": args.test_command,
+            "test_command": args.test_command, "test_timeout": args.test_timeout,
             **_scan_options(args)}, force=args.force)
         _print(out)
         _warn_coverage(out)
@@ -203,24 +214,13 @@ def cmd_import(args):
 
 def cmd_deviate(args):
     eng = _engine(args)
-    meta = REGISTRY.resolve(args.rule)
-    if not meta:
-        print(f"Unknown rule '{args.rule}'", file=sys.stderr)
-        sys.exit(1)
-    expires_at = None
-    if args.expires:
-        try:
-            expires_at = time.mktime(time.strptime(args.expires, "%Y-%m-%d"))
-        except ValueError:
-            print(f"--expires must be YYYY-MM-DD (got '{args.expires}')", file=sys.stderr)
-            sys.exit(1)
-    try:
-        did = eng.mem.add_deviation(meta["id"], args.scope, args.justification,
-                                    args.approver, args.expires_days or None, expires_at)
-    except MandatoryRuleError as e:
-        print(str(e), file=sys.stderr)
-        sys.exit(1)
-    _print({"deviation_id": did, "rule_id": meta["id"]})
+    _emit(eng.deviate(args.rule, args.scope, args.justification, args.approver,
+                      args.expires_days or None, args.expires))
+
+
+def cmd_revoke_deviation(args):
+    eng = _engine(args)
+    _emit(eng.revoke_deviation(args.id, args.by, args.reason))
 
 
 def cmd_doctor(args):
@@ -237,8 +237,51 @@ def cmd_doctor(args):
 
 def cmd_suppress(args):
     eng = _engine(args)
-    eng.mem.suppress(args.fingerprint, args.reason)
-    _print({"suppressed": args.fingerprint})
+    _emit(eng.suppress(args.fingerprint, args.reason, args.approver,
+                       args.expires_days or None, args.expires))
+
+
+def cmd_unsuppress(args):
+    eng = _engine(args)
+    _emit(eng.unsuppress(args.fingerprint, args.by, args.reason))
+
+
+def cmd_proposals(args):
+    eng = _engine(args)
+    if args.action == "list":
+        status = None if args.all else "pending_human"
+        rows = eng.list_proposals(status)
+        if args.json:
+            _print(rows)
+        elif not rows:
+            print("No pending proposals." if status else "No proposals.")
+        else:
+            for r in rows:
+                print(f"{r['id']}  [{r['status']}] {r['kind']:<12} {r['summary']}")
+        return
+    if not args.id:
+        print(f"proposals {args.action} needs a proposal id.", file=sys.stderr)
+        sys.exit(1)
+    if args.action == "accept":
+        _emit(eng.accept_proposal(args.id, args.by or ""))
+    else:
+        _emit(eng.reject_proposal(args.id, args.by or "", args.reason or ""))
+
+
+def cmd_audit(args):
+    eng = _engine(args)
+    rows = eng.mem.audit_entries(args.limit, args.action)
+    if args.json:
+        _print(rows)
+        return
+    if not rows:
+        print("Audit log is empty.")
+        return
+    for r in rows:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["ts"]))
+        mark = "  [AGENT]" if r["source"] == "mcp" else ""
+        print(f"{ts}  {r['source']:<6} {r['action']:<24} {r['actor'] or '-':<18} "
+              f"{r['target']}{mark}")
 
 
 def cmd_note(args):
@@ -338,7 +381,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="How a fix is confirmed resolved (default: test_gated if "
                         "--test-command is set, else human_gated).")
     s.add_argument("--test-command",
-                   help="Shell command that must exit 0 to confirm fixes (e.g. 'make test').")
+                   help="Command that must exit 0 to confirm fixes (e.g. 'make test'). Split "
+                        "with shlex and run WITHOUT a shell; use \"sh -c '...'\" for pipes. "
+                        "Falls back to MAISHAC_TEST_COMMAND, then .maishac/config.json.")
+    s.add_argument("--test-timeout", type=float, metavar="SECONDS",
+                   help="Kill the test command (and its children) after this long "
+                        "(default 600; MAISHAC_TEST_TIMEOUT / config.json 'test_timeout').")
     s.add_argument("--force", action="store_true",
                    help="Start a new session even if one is already active on this project.")
     _add_scan_options(s)
@@ -364,10 +412,47 @@ def build_parser() -> argparse.ArgumentParser:
                    help="permit lifetime in days from now (alternative to --expires)")
     s.set_defaults(fn=cmd_deviate)
 
+    s = sub.add_parser("revoke-deviation", help="Revoke a deviation permit (kept in the audit log)")
+    s.add_argument("id")
+    s.add_argument("--by", default="", help="who is revoking it")
+    s.add_argument("--reason", "-r", default="")
+    s.set_defaults(fn=cmd_revoke_deviation)
+
     s = sub.add_parser("suppress", help="Suppress a false positive")
     s.add_argument("fingerprint")
     s.add_argument("--reason", "-r", required=True)
+    s.add_argument("--approver", default="", help="who stands behind this suppression")
+    s.add_argument("--expires", help="suppression expiry as a date, YYYY-MM-DD (end of that day)")
+    s.add_argument("--expires-days", type=float, default=0)
     s.set_defaults(fn=cmd_suppress)
+
+    s = sub.add_parser("unsuppress", help="Remove a suppression (kept in the audit log)")
+    s.add_argument("fingerprint")
+    s.add_argument("--by", default="", help="who is removing it")
+    s.add_argument("--reason", "-r", default="")
+    s.set_defaults(fn=cmd_unsuppress)
+
+    s = sub.add_parser("uncategorize", help="Remove a GRP re-categorization (kept in the audit log)")
+    s.add_argument("rule")
+    s.add_argument("--by", default="")
+    s.add_argument("--reason", "-r", default="")
+    s.set_defaults(fn=cmd_uncategorize)
+
+    s = sub.add_parser("proposals", help="Review sign-offs an MCP agent proposed "
+                                         "(approve/deviate/suppress/recategorize)")
+    s.add_argument("action", choices=["list", "accept", "reject"])
+    s.add_argument("id", nargs="?")
+    s.add_argument("--by", help="the human accepting/rejecting (recorded as approver)")
+    s.add_argument("--reason", "-r", default="", help="note when rejecting")
+    s.add_argument("--all", action="store_true", help="list: include decided proposals")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_proposals)
+
+    s = sub.add_parser("audit", help="Show the append-only audit log of sign-offs and sessions")
+    s.add_argument("--limit", type=int, default=50)
+    s.add_argument("--action", help="only this action, e.g. suppress")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_audit)
 
     s = sub.add_parser("note", help="Persist project knowledge")
     s.add_argument("content")

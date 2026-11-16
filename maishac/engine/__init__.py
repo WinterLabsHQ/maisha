@@ -30,7 +30,11 @@ Guards:
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
+import os
+import shlex
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -38,7 +42,7 @@ from pathlib import Path
 from ..analyzers import run_scan_detailed, available_analyzers
 from ..analyzers.base import validate_compiler_flags
 from ..model import relpath
-from ..memory import MemoryStore
+from ..memory import MandatoryRuleError, MemoryStore
 from ..rules import REGISTRY
 
 DEFAULT_CONFIG = {
@@ -56,7 +60,9 @@ DEFAULT_CONFIG = {
     #   human_gated    a human must call approve_finding first
     # None => auto: test_gated if test_command is set, else human_gated.
     "verification_policy": None,
-    "test_command": None,       # shell command; exit 0 confirms pending fixes
+    "test_command": None,       # argv-style command (shlex, no shell); exit 0 confirms pending fixes.
+                                # Human-set only: CLI flag, MAISHAC_TEST_COMMAND or .maishac/config.json
+    "test_timeout": None,       # seconds; default 600 (MAISHAC_TEST_TIMEOUT / config.json / --test-timeout)
     "include_paths": None,      # -I dirs forwarded to cppcheck/clang-tidy
     "exclude": None,            # extra fnmatch patterns for directories to skip
     "default_excludes": True,   # also skip .git, build, node_modules, ... (see analyzers.base)
@@ -64,6 +70,70 @@ DEFAULT_CONFIG = {
     "compiler_flags": None,     # extra -D/-U/-I/-std flags (closed list, validated)
     "compile_commands": None,   # compile_commands.json to take per-file flags from
 }
+
+# Human sign-off kinds an MCP agent may only *propose* (see LoopEngine.propose).
+PROPOSAL_KINDS = ("approve", "deviate", "suppress", "recategorize")
+MIN_JUSTIFICATION = 15   # chars: deviation rationale
+MIN_REASON = 10          # chars: suppression reason
+DEFAULT_TEST_TIMEOUT = 600
+
+ALLOW_AGENT_APPROVALS_ENV = "MAISHAC_ALLOW_AGENT_APPROVALS"
+
+
+def agent_approvals_allowed() -> bool:
+    """True when the operator opted in to letting MCP tools approve, deviate,
+    suppress and recategorize directly. Unsafe: the agent then grades its own work."""
+    return os.environ.get(ALLOW_AGENT_APPROVALS_ENV, "").strip().lower() in ("1", "true", "yes")
+
+
+def load_project_config(root: Path) -> dict:
+    """Human-controlled settings from <project>/.maishac/config.json (test_command,
+    test_timeout). Unreadable/invalid files are ignored with no effect."""
+    try:
+        data = json.loads((Path(root) / ".maishac" / "config.json").read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _parse_expiry(expires_days, expires) -> tuple[float | None, str]:
+    """-> (absolute expiry timestamp or None, error). ``expires`` is YYYY-MM-DD and
+    means the END of that day (local time); ``expires_days`` is a lifetime from now."""
+    at = None
+    if expires_days not in (None, 0, 0.0):
+        try:
+            days = float(expires_days)
+        except (TypeError, ValueError):
+            return None, f"expires_days must be a number (got '{expires_days}')."
+        if days < 0:
+            return None, "expires_days must not be negative."
+        at = time.time() + days * 86400
+    if expires:
+        try:
+            d = _dt.datetime.strptime(str(expires), "%Y-%m-%d")
+        except ValueError:
+            return None, f"expires must be YYYY-MM-DD (got '{expires}')."
+        at = d.replace(hour=23, minute=59, second=59).timestamp()
+        if at <= time.time():
+            return None, f"expires {expires} is already in the past."
+    return at, ""
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the test command AND everything it spawned."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=30)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
 
 _VALID_POLICIES = ("analyzer_only", "test_gated", "human_gated")
 
@@ -76,9 +146,10 @@ def _severities_at_or_above(floor: str) -> list[str]:
 
 
 class LoopEngine:
-    def __init__(self, project_root: str | Path):
+    def __init__(self, project_root: str | Path, source: str = "cli"):
         self.root = Path(project_root).resolve()
         self.mem = MemoryStore(self.root)
+        self.source = source   # cli|mcp: recorded on every audited action
 
     # ------------------------------------------------------------------ scan
     def scan(self, paths: list[str], analyzers: list[str] | None = None,
@@ -123,7 +194,7 @@ class LoopEngine:
             out["coverage_warning"] = "\n".join(warnings)
         return out
 
-    def import_sarif(self, path: str | Path) -> dict:
+    def import_sarif(self, path: str | Path, carry_suppressions: bool = True) -> dict:
         """Ingest findings from an external SARIF file (e.g. a qualified engine
         like Helix QAC / Polyspace, or cppcheck's own --sarif output) into the
         same memory/loop/gate machinery as a native scan. Imported findings are
@@ -138,11 +209,19 @@ class LoopEngine:
         findings = report_mod.parse_sarif(data, self.root)
         # Pre-record incoming suppressions so sync_scan buckets them as
         # suppressed instead of new/open (bring-your-own-triage).
-        carried = 0
+        carried, refused, ignored = 0, 0, 0
         for f in findings:
-            if f.suppression:
+            if not f.suppression:
+                continue
+            if not carry_suppressions:
+                ignored += 1       # an agent-driven import must not launder findings
+            elif self.mem.is_mandatory(f.rule_id):
+                refused += 1       # Mandatory guidelines admit no suppression
+            else:
                 self.mem.suppress(f.fingerprint, f.suppression.get("justification")
-                                  or "suppressed in imported SARIF")
+                                  or "suppressed in imported SARIF",
+                                  approver="sarif-import", source="import",
+                                  rule_id=f.rule_id)
                 carried += 1
         diff = self.mem.sync_scan(findings, [], producers=set())
         tools = sorted({f.analyzer for f in findings})
@@ -154,6 +233,14 @@ class LoopEngine:
             "tools": tools,
             "imported": len(findings),
             "suppressions_carried": carried,
+            **({"suppressions_refused_mandatory": refused,
+                "warning": f"{refused} imported suppression(s) target MISRA Mandatory "
+                           "guidelines and were NOT applied; those findings stay open."}
+               if refused else {}),
+            **({"suppressions_ignored": ignored,
+                "note": f"{ignored} suppression(s) in the SARIF were not applied because "
+                        "this import was started by an agent; run `maishac import` from "
+                        "the CLI to carry them over."} if ignored else {}),
             "diff": {k: len(v) for k, v in diff.items()},
             "open": len(self.mem.open_findings(limit=100000)),
         }
@@ -212,16 +299,41 @@ class LoopEngine:
             return p
         return "test_gated" if cfg.get("test_command") else "human_gated"
 
-    def _run_tests(self, cmd: str) -> dict:
+    def _run_tests(self, cmd: str, timeout: float | None = None) -> dict:
+        """Run the human-configured test command. It is split with shlex and run
+        WITHOUT a shell (no injection through metacharacters; use `sh -c '...'`
+        explicitly if pipes or && are needed). It gets its own process group so a
+        timeout kills the whole tree, not just the top process."""
         # ponytail: pass/fail on exit code only — doesn't diff new-vs-baseline
         # failures. Add a baseline capture if a flaky suite needs delta scoring.
+        timeout = DEFAULT_TEST_TIMEOUT if timeout in (None, 0) else float(timeout)
         try:
-            proc = subprocess.run(cmd, shell=True, cwd=self.root,
-                                  capture_output=True, text=True, timeout=1800)
-        except Exception as e:  # noqa: BLE001 — surface any launch/timeout failure to the loop
+            argv = shlex.split(cmd, posix=os.name != "nt")
+            if not argv:
+                raise ValueError("test command is empty")
+            popen_kw = ({"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+                        if os.name == "nt" else {"start_new_session": True})
+            proc = subprocess.Popen(argv, cwd=self.root, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, errors="replace", **popen_kw)
+        except Exception as e:  # noqa: BLE001 — surface any launch failure to the loop
+            return {"ran": False, "passed": False, "error": str(e), "command": cmd}
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            try:
+                out, err = proc.communicate(timeout=10)
+            except Exception:  # noqa: BLE001
+                out, err = "", ""
+            return {"ran": False, "passed": False, "timed_out": True, "command": cmd,
+                    "error": f"test command timed out after {timeout:g}s and was killed",
+                    "output_tail": ((out or "") + (err or ""))[-2000:]}
+        except Exception as e:  # noqa: BLE001
+            _kill_tree(proc)
             return {"ran": False, "passed": False, "error": str(e), "command": cmd}
         return {"ran": True, "passed": proc.returncode == 0, "exit_code": proc.returncode,
-                "command": cmd, "output_tail": (proc.stdout + proc.stderr)[-2000:]}
+                "command": cmd, "output_tail": ((out or "") + (err or ""))[-2000:]}
 
     # MISRA Compliance:2020 §5.4: which re-categorizations are permitted, keyed
     # by the guideline's *original* category. A Mandatory guideline may not be
@@ -233,12 +345,16 @@ class LoopEngine:
         "advisory": {"mandatory", "required", "disapplied"},
     }
 
-    def recategorize(self, rule: str, to_category: str, rationale: str,
-                     approver: str = "") -> dict:
-        """Record a GRP re-categorization, enforcing MISRA's legality rules."""
+    # ----------------------------------------------- audited human sign-offs
+    # Every method below is the single implementation behind both the CLI and the
+    # MCP tools, so validation cannot drift. An MCP agent reaches them only via
+    # propose()/accept_proposal() unless the operator set
+    # MAISHAC_ALLOW_AGENT_APPROVALS=1.
+
+    def _check_recategorize(self, rule, to_category, rationale, approver="") -> dict:
         meta = REGISTRY.resolve(rule)
         if not meta:
-            return {"error": f"Unknown rule '{rule}'"}
+            return {"error": REGISTRY.resolve_error(rule)}
         target = (to_category or "").strip().lower()
         valid = {"mandatory", "required", "advisory", "disapplied"}
         if target not in valid:
@@ -251,19 +367,212 @@ class LoopEngine:
                              f"{current.capitalize()} guideline to {target.capitalize()} "
                              f"({meta['id']}). Allowed from {current}: "
                              f"{sorted(self._GRP_ALLOWED.get(current, set())) or 'none'}."}
-        self.mem.add_recategorization(meta["id"], target, rationale.strip(), approver.strip())
-        return {"rule_id": meta["id"], "from_category": current, "to_category": target,
-                "approver": approver.strip() or None}
+        return {"rule": meta["id"], "to_category": target, "rationale": rationale.strip(),
+                "approver": (approver or "").strip(), "_current": current}
 
-    def approve(self, fingerprint: str, approved_by: str) -> dict:
-        if not (approved_by or "").strip():
+    def recategorize(self, rule: str, to_category: str, rationale: str,
+                     approver: str = "", source: str | None = None) -> dict:
+        """Record a GRP re-categorization, enforcing MISRA's legality rules."""
+        c = self._check_recategorize(rule, to_category, rationale, approver)
+        if "error" in c:
+            return c
+        self.mem.add_recategorization(c["rule"], c["to_category"], c["rationale"],
+                                      c["approver"], source or self.source)
+        return {"rule_id": c["rule"], "from_category": c["_current"],
+                "to_category": c["to_category"], "approver": c["approver"] or None}
+
+    def _check_approve(self, fingerprint, approved_by="", need_identity=True) -> dict:
+        f = self.mem.get_finding(fingerprint)
+        if not f:
+            return {"error": f"No finding with fingerprint '{fingerprint}'."}
+        if need_identity and not (approved_by or "").strip():
             return {"error": "approved_by is required — record who signed off on this fix."}
-        return self.mem.approve_finding(fingerprint, approved_by.strip())
+        if f["status"] not in ("pending_verification", "resolved"):
+            return {"error": f"Finding is '{f['status']}', not pending_verification — the "
+                             "analyzer still flags it. Fix it (and re-verify) before approving."}
+        return {"fingerprint": fingerprint, "approved_by": (approved_by or "").strip()}
+
+    def approve(self, fingerprint: str, approved_by: str, source: str | None = None) -> dict:
+        c = self._check_approve(fingerprint, approved_by)
+        if "error" in c:
+            return c
+        return self.mem.approve_finding(fingerprint, c["approved_by"], source or self.source)
+
+    def _check_deviate(self, rule, scope="*", justification="", approver="",
+                       expires_days=None, expires=None) -> dict:
+        meta = REGISTRY.resolve(rule)
+        if not meta:
+            return {"error": REGISTRY.resolve_error(rule)}
+        if len((justification or "").strip()) < MIN_JUSTIFICATION:
+            return {"error": "Justification too short; write a real engineering rationale "
+                             f"(at least {MIN_JUSTIFICATION} characters)."}
+        if not (scope or "").strip():
+            return {"error": "scope must be a non-empty glob over project-relative paths."}
+        at, err = _parse_expiry(expires_days, expires)
+        if err:
+            return {"error": err}
+        if self.mem.is_mandatory(meta["id"]):
+            return {"error": f"{meta['id']} is a MISRA Mandatory guideline; deviations are "
+                             "not permitted against it. It must be fixed, not waived."}
+        return {"rule": meta["id"], "scope": scope.strip(), "justification": justification.strip(),
+                "approver": (approver or "").strip(), "expires_at": at}
+
+    def deviate(self, rule: str, scope: str = "*", justification: str = "", approver: str = "",
+                expires_days: float | None = None, expires: str | None = None,
+                source: str | None = None) -> dict:
+        c = self._check_deviate(rule, scope, justification, approver, expires_days, expires)
+        if "error" in c:
+            return c
+        try:
+            did = self.mem.add_deviation(c["rule"], c["scope"], c["justification"],
+                                         c["approver"], expires_at=c["expires_at"],
+                                         source=source or self.source)
+        except (MandatoryRuleError, ValueError) as e:
+            return {"error": str(e)}
+        return {"deviation_id": did, "rule_id": c["rule"], "scope": c["scope"],
+                "note": "Re-run scan or verify to apply."}
+
+    def _check_suppress(self, fingerprint, reason="", approver="",
+                        expires_days=None, expires=None) -> dict:
+        f = self.mem.get_finding(fingerprint)
+        if not f:
+            return {"error": f"No finding with fingerprint '{fingerprint}'."}
+        if len((reason or "").strip()) < MIN_REASON:
+            return {"error": "Reason too short; explain why the analyzer is wrong here "
+                             f"(at least {MIN_REASON} characters)."}
+        at, err = _parse_expiry(expires_days, expires)
+        if err:
+            return {"error": err}
+        if self.mem.is_mandatory(f["rule_id"]):
+            return {"error": f"{f['rule_id']} is a MISRA Mandatory guideline; suppression is "
+                             "not permitted against it. It must be fixed, not waived."}
+        return {"fingerprint": fingerprint, "reason": reason.strip(),
+                "approver": (approver or "").strip(), "expires_at": at}
+
+    def suppress(self, fingerprint: str, reason: str, approver: str = "",
+                 expires_days: float | None = None, expires: str | None = None,
+                 source: str | None = None) -> dict:
+        c = self._check_suppress(fingerprint, reason, approver, expires_days, expires)
+        if "error" in c:
+            return c
+        try:
+            self.mem.suppress(fingerprint, c["reason"], c["approver"],
+                              source or self.source, c["expires_at"])
+        except (MandatoryRuleError, ValueError) as e:
+            return {"error": str(e)}
+        return {"suppressed": fingerprint}
+
+    # --------------------------------------------------------- revocations
+    def unsuppress(self, fingerprint: str, removed_by: str = "", reason: str = "",
+                   source: str | None = None) -> dict:
+        return self.mem.unsuppress(fingerprint, removed_by, source or self.source, reason)
+
+    def revoke_deviation(self, deviation_id: str, revoked_by: str = "", reason: str = "",
+                         source: str | None = None) -> dict:
+        return self.mem.revoke_deviation(deviation_id, revoked_by, source or self.source, reason)
+
+    def remove_recategorization(self, rule: str, removed_by: str = "", reason: str = "",
+                                source: str | None = None) -> dict:
+        meta = REGISTRY.resolve(rule)
+        if not meta:
+            return {"error": REGISTRY.resolve_error(rule)}
+        return self.mem.remove_recategorization(meta["id"], removed_by,
+                                                source or self.source, reason)
+
+    # ------------------------------------------------------------- proposals
+    _CHECKS = {"approve": "_check_approve", "deviate": "_check_deviate",
+               "suppress": "_check_suppress", "recategorize": "_check_recategorize"}
+    # which payload key carries the human who takes responsibility on accept
+    _IDENTITY_KEY = {"approve": "approved_by", "deviate": "approver",
+                     "suppress": "approver", "recategorize": "approver"}
+
+    def propose(self, kind: str, **args) -> dict:
+        """Record a sign-off an agent asked for. Nothing takes effect until a human
+        runs `maishac proposals accept <id> --by <name>` (or the direct command)."""
+        if kind not in PROPOSAL_KINDS:
+            return {"error": f"Unknown proposal kind '{kind}'."}
+        check = getattr(self, self._CHECKS[kind])
+        c = (check(args.get("fingerprint"), args.get("approved_by", ""), need_identity=False)
+             if kind == "approve" else check(**args))
+        if "error" in c:
+            return c
+        payload = {k: v for k, v in args.items() if v not in (None, "")}
+        if kind in ("deviate", "recategorize"):
+            payload["rule"] = c["rule"]   # store the canonical id, not the typed form
+        summary = self._summarize(kind, payload)
+        pid = self.mem.add_proposal(kind, payload, summary, source=self.source)
+        return {"proposal_id": pid, "status": "pending_human", "summary": summary,
+                "note": "NOT applied. A human must finalize it with the CLI: "
+                        f"`maishac proposals accept {pid} --by <name>` "
+                        "(list pending ones with `maishac proposals list`). "
+                        "Tell the user this is awaiting their decision; do not retry."}
+
+    @staticmethod
+    def _summarize(kind: str, p: dict) -> str:
+        if kind == "approve":
+            return f"approve fix for finding {p.get('fingerprint')}"
+        if kind == "suppress":
+            return f"suppress finding {p.get('fingerprint')}: {p.get('reason', '')[:80]}"
+        if kind == "deviate":
+            return f"deviate from {p.get('rule')} in '{p.get('scope', '*')}': " \
+                   f"{p.get('justification', '')[:80]}"
+        return f"recategorize {p.get('rule')} to {p.get('to_category')}: {p.get('rationale', '')[:80]}"
+
+    def accept_proposal(self, pid: str, by: str) -> dict:
+        by = (by or "").strip()
+        if not by:
+            return {"error": "--by is required: record the human who accepts this."}
+        prop = self.mem.get_proposal(pid)
+        if not prop:
+            return {"error": f"No proposal '{pid}'."}
+        if prop["status"] != "pending_human":
+            return {"error": f"Proposal '{pid}' is already {prop['status']}."}
+        payload = dict(prop["payload"])
+        payload[self._IDENTITY_KEY[prop["kind"]]] = by
+        method = {"approve": self.approve, "deviate": self.deviate,
+                  "suppress": self.suppress, "recategorize": self.recategorize}[prop["kind"]]
+        result = method(**payload, source="cli")
+        if "error" in result:
+            return {"error": f"Proposal '{pid}' can no longer be applied: {result['error']}",
+                    "proposal_id": pid, "status": "pending_human"}
+        self.mem.decide_proposal(pid, "accepted", by, result=result)
+        return {"proposal_id": pid, "status": "accepted", "result": result}
+
+    def reject_proposal(self, pid: str, by: str, note: str = "") -> dict:
+        by = (by or "").strip()
+        if not by:
+            return {"error": "--by is required: record the human who rejects this."}
+        prop = self.mem.get_proposal(pid)
+        if not prop:
+            return {"error": f"No proposal '{pid}'."}
+        if prop["status"] != "pending_human":
+            return {"error": f"Proposal '{pid}' is already {prop['status']}."}
+        self.mem.decide_proposal(pid, "rejected", by, note)
+        return {"proposal_id": pid, "status": "rejected"}
+
+    def list_proposals(self, status: str | None = "pending_human") -> list[dict]:
+        return self.mem.proposals(status)
 
     # --------------------------------------------------------------- session
     def begin_session(self, paths: list[str], config: dict | None = None,
                       force: bool = False) -> dict:
         cfg = {**DEFAULT_CONFIG, **(config or {}), "paths": paths}
+        # The test command runs on the host, so it comes only from human-controlled
+        # places: the CLI flag, MAISHAC_TEST_COMMAND, or .maishac/config.json.
+        # The MCP tools have no way to set it.
+        project_cfg = load_project_config(self.root)
+        if not cfg.get("test_command"):
+            cfg["test_command"] = (os.environ.get("MAISHAC_TEST_COMMAND", "").strip()
+                                   or project_cfg.get("test_command") or None)
+        if not cfg.get("test_timeout"):
+            env_t = os.environ.get("MAISHAC_TEST_TIMEOUT", "").strip()
+            try:
+                cfg["test_timeout"] = float(env_t or project_cfg.get("test_timeout")
+                                            or DEFAULT_TEST_TIMEOUT)
+            except (TypeError, ValueError):
+                return {"error": "test_timeout must be a number of seconds."}
+        if cfg["test_timeout"] <= 0:
+            return {"error": "test_timeout must be a positive number of seconds."}
         # Guard against two sessions racing on the same .maishac/memory.db
         # (e.g. a CI job and a local run). They'd fight over finding state.
         existing = self.mem.latest_active_session()
@@ -274,6 +583,9 @@ class LoopEngine:
                     "active_session_id": existing["id"]}
         baseline = self.scan(paths, cfg.get("analyzers"), **self._scan_kwargs(cfg))
         sid = self.mem.create_session(cfg)
+        self.mem.audit("session_start", sid, source=self.source,
+                       details={"paths": paths, "verification_policy": self._policy(cfg),
+                                "test_command_configured": bool(cfg.get("test_command"))})
         self.mem.update_session(sid, history=[{
             "iteration": 0, "event": "baseline",
             "open": baseline["open"], "ts": time.time(),
@@ -364,7 +676,7 @@ class LoopEngine:
         # resolved until a passing test run or a human confirms it.
         test_run, confirmed_by_test = None, []
         if policy == "test_gated" and cfg.get("test_command"):
-            test_run = self._run_tests(cfg["test_command"])
+            test_run = self._run_tests(cfg["test_command"], cfg.get("test_timeout"))
             if test_run.get("passed"):
                 confirmed_by_test = self.mem.confirm_pending_by_test()
 
@@ -422,6 +734,9 @@ class LoopEngine:
 
         self.mem.update_session(session_id, status=state if state != "active" else "active",
                                 iteration=iteration, history=history)
+        if state in ("converged", "budget_exhausted", "stalled"):
+            self.mem.audit("session_end", session_id, source=self.source,
+                           details={"state": state, "iteration": iteration, "reason": reason})
         return {
             "session_id": session_id,
             "iteration": iteration,

@@ -77,7 +77,8 @@ CREATE TABLE IF NOT EXISTS findings (
   analyzer_cleared_at REAL,      -- when the analyzer stopped flagging it (still unverified)
   verification_method TEXT,      -- analyzer|test|human — how it reached 'resolved'
   approved_by TEXT,
-  approved_at REAL
+  approved_at REAL,
+  approval_source TEXT           -- cli|mcp: which surface recorded the human approval
 );
 CREATE TABLE IF NOT EXISTS fix_attempts (
   id TEXT PRIMARY KEY,
@@ -95,19 +96,26 @@ CREATE TABLE IF NOT EXISTS deviations (
   justification TEXT NOT NULL,
   approver TEXT,
   expires REAL,
-  ts REAL NOT NULL
+  ts REAL NOT NULL,
+  source TEXT NOT NULL DEFAULT 'cli',
+  revoked_at REAL,                    -- set by revoke_deviation; a revoked permit never applies
+  revoked_by TEXT
 );
 CREATE TABLE IF NOT EXISTS suppressions (
   fingerprint TEXT PRIMARY KEY,
   reason TEXT NOT NULL,
-  ts REAL NOT NULL
+  ts REAL NOT NULL,
+  approver TEXT,                      -- who stood behind the suppression
+  source TEXT NOT NULL DEFAULT 'cli', -- cli|mcp: which surface recorded it
+  expires REAL                        -- optional; an expired suppression no longer applies
 );
 CREATE TABLE IF NOT EXISTS recategorizations (
   rule_id TEXT PRIMARY KEY,
   to_category TEXT NOT NULL,          -- mandatory|required|advisory|disapplied (GRP target)
   rationale TEXT NOT NULL,
   approver TEXT,
-  ts REAL NOT NULL
+  ts REAL NOT NULL,
+  source TEXT NOT NULL DEFAULT 'cli'
 );
 CREATE TABLE IF NOT EXISTS notes (
   id TEXT PRIMARY KEY,
@@ -137,6 +145,30 @@ CREATE TABLE IF NOT EXISTS scans (
   degraded INTEGER NOT NULL DEFAULT 0,  -- 1 if a tool was missing/deselected or an analyzer failed
   maishac_version TEXT
 );
+-- Append-only: rows are only ever inserted, never updated or deleted.
+CREATE TABLE IF NOT EXISTS audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts REAL NOT NULL,
+  actor TEXT,
+  source TEXT NOT NULL,            -- cli|mcp|engine
+  action TEXT NOT NULL,
+  target TEXT,
+  details TEXT                     -- JSON
+);
+-- Changes an MCP agent asked for; they take effect only when a human accepts them.
+CREATE TABLE IF NOT EXISTS proposals (
+  id TEXT PRIMARY KEY,
+  ts REAL NOT NULL,
+  kind TEXT NOT NULL,              -- approve|deviate|suppress|recategorize
+  payload TEXT NOT NULL,           -- JSON arguments, already validated
+  summary TEXT,
+  source TEXT NOT NULL DEFAULT 'mcp',
+  status TEXT NOT NULL DEFAULT 'pending_human',   -- pending_human|accepted|rejected
+  decided_by TEXT,
+  decided_at REAL,
+  decision_note TEXT,
+  result TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status);
 CREATE INDEX IF NOT EXISTS idx_attempts_fp ON fix_attempts(fingerprint);
 """
@@ -146,7 +178,9 @@ CREATE INDEX IF NOT EXISTS idx_attempts_fp ON fix_attempts(fingerprint);
 # versioning existed (or brand new, before _migrate stamps it).
 #   1: (implicit) verification-gate columns on findings
 #   2: findings."column", scans table
-SCHEMA_VERSION = 2
+#   3: source/approver/expiry on suppressions, source + revocation on deviations,
+#      source on recategorizations, findings.approval_source, audit_log, proposals
+SCHEMA_VERSION = 3
 
 
 class MemoryStore:
@@ -181,11 +215,22 @@ class MemoryStore:
         for name, ddl in [("semantic_risk", "INTEGER NOT NULL DEFAULT 0"),
                           ("analyzer_cleared_at", "REAL"), ("verification_method", "TEXT"),
                           ("approved_by", "TEXT"), ("approved_at", "REAL"),
-                          ("code_flow", "TEXT"), ('"column"', "INTEGER")]:
+                          ("code_flow", "TEXT"), ('"column"', "INTEGER"),
+                          ("approval_source", "TEXT")]:
             if name.strip('"') not in cols:
                 self.db.execute(f"ALTER TABLE findings ADD COLUMN {name} {ddl}")
-        # `scans` is created by _SCHEMA (CREATE TABLE IF NOT EXISTS), which also
-        # runs against old databases. Just stamp the version.
+        for table, additions in (
+                ("suppressions", [("approver", "TEXT"), ("source", "TEXT NOT NULL DEFAULT 'cli'"),
+                                  ("expires", "REAL")]),
+                ("deviations", [("source", "TEXT NOT NULL DEFAULT 'cli'"),
+                                ("revoked_at", "REAL"), ("revoked_by", "TEXT")]),
+                ("recategorizations", [("source", "TEXT NOT NULL DEFAULT 'cli'")])):
+            have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            for name, ddl in additions:
+                if name not in have:
+                    self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        # `scans`, `audit_log` and `proposals` are created by _SCHEMA (CREATE TABLE
+        # IF NOT EXISTS), which also runs against old databases. Just stamp the version.
         if self.db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
             self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -227,7 +272,12 @@ class MemoryStore:
         scanned = set(scanned_files)
 
         for fp, f in current.items():
-            if self.is_suppressed(fp):
+            if self.is_mandatory(f.rule_id):
+                # A Mandatory guideline admits no waiver: any suppression or
+                # permit that predates the guard (or a later GRP move to
+                # Mandatory) is ignored, the finding stays open.
+                status = "open"
+            elif self.is_suppressed(fp):
                 diff["suppressed"].append(fp)
                 status = "suppressed"
             elif self.matching_deviation(f.rule_id, f.file):
@@ -362,12 +412,13 @@ class MemoryStore:
         return len(self.pending_findings(require_human))
 
     def _mark_resolved(self, fingerprint: str, method: str,
-                       approved_by: str | None = None) -> None:
+                       approved_by: str | None = None, source: str | None = None) -> None:
         now = time.time()
         self.db.execute(
             "UPDATE findings SET status='resolved', resolved_at=?, verification_method=?, "
-            "approved_by=?, approved_at=? WHERE fingerprint=?",
-            (now, method, approved_by, now if approved_by else None, fingerprint))
+            "approved_by=?, approved_at=?, approval_source=? WHERE fingerprint=?",
+            (now, method, approved_by, now if approved_by else None,
+             source if approved_by else None, fingerprint))
         self.db.execute("UPDATE fix_attempts SET outcome='resolved' "
                         "WHERE fingerprint=? AND outcome='pending'", (fingerprint,))
 
@@ -379,11 +430,13 @@ class MemoryStore:
             if requires_human(r):
                 continue
             self._mark_resolved(r["fingerprint"], "test")
+            self.audit("confirm_by_test", r["fingerprint"], actor="test", source="engine",
+                       commit=False)
             confirmed.append(r["fingerprint"])
         self.db.commit()
         return confirmed
 
-    def approve_finding(self, fingerprint: str, approved_by: str) -> dict:
+    def approve_finding(self, fingerprint: str, approved_by: str, source: str = "cli") -> dict:
         r = self.get_finding(fingerprint)
         if not r:
             return {"error": f"No finding with fingerprint '{fingerprint}'."}
@@ -392,9 +445,12 @@ class MemoryStore:
         if r["status"] != "pending_verification":
             return {"error": f"Finding is '{r['status']}', not pending_verification — the "
                              "analyzer still flags it. Fix it (and re-verify) before approving."}
-        self._mark_resolved(fingerprint, "human", approved_by)
+        self._mark_resolved(fingerprint, "human", approved_by, source)
+        self.audit("approve_finding", fingerprint, actor=approved_by, source=source,
+                   details={"rule_id": r["rule_id"], "file": r["file"]}, commit=False)
         self.db.commit()
-        return {"ok": True, "resolved": fingerprint, "approved_by": approved_by}
+        return {"ok": True, "resolved": fingerprint, "approved_by": approved_by,
+                "source": source}
 
     # ---------------------------------------------------------- fix attempts
     def record_fix_attempt(self, fingerprint: str, session_id: str,
@@ -421,31 +477,91 @@ class MemoryStore:
             "SELECT strategy FROM fix_attempts WHERE fingerprint=? "
             "AND outcome IN ('persisting','regressed','abandoned')", (fingerprint,))]
 
+    # ------------------------------------------------------------ audit log
+    def audit(self, action: str, target: str = "", actor: str = "", source: str = "cli",
+              details: dict | None = None, commit: bool = True) -> None:
+        """Append one row to the audit log. The table is insert-only: nothing in
+        Maisha updates or deletes it, so it keeps what an overwrite would erase."""
+        self.db.execute(
+            "INSERT INTO audit_log (ts, actor, source, action, target, details)"
+            " VALUES (?,?,?,?,?,?)",
+            (time.time(), actor or "", source, action, target or "",
+             json.dumps(details, default=str) if details else None))
+        if commit:
+            self.db.commit()
+
+    def audit_entries(self, limit: int = 100, action: str | None = None) -> list[dict]:
+        q, args = "SELECT * FROM audit_log", []
+        if action:
+            q += " WHERE action=?"
+            args.append(action)
+        q += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        out = []
+        for r in self.db.execute(q, args):
+            d = dict(r)
+            d["details"] = json.loads(d["details"]) if d["details"] else {}
+            out.append(d)
+        return out
+
+    # ------------------------------------------------- effective categories
+    def effective_category(self, rule_id: str) -> Optional[str]:
+        """A guideline's category after this project's GRP re-categorizations
+        (mandatory|required|advisory|disapplied), or None for an unknown rule."""
+        from ..rules import REGISTRY
+        meta = REGISTRY.get(rule_id) or REGISTRY.resolve(rule_id)
+        rid = meta["id"] if meta else rule_id
+        r = self.db.execute("SELECT to_category FROM recategorizations WHERE rule_id=?",
+                            (rid,)).fetchone()
+        if r:
+            return r["to_category"]
+        return (meta.get("category") if meta else None)
+
+    def is_mandatory(self, rule_id: str) -> bool:
+        return self.effective_category(rule_id) == "mandatory"
+
+    def _require_not_mandatory(self, rule_id: str, what: str) -> None:
+        if self.is_mandatory(rule_id):
+            from ..rules import REGISTRY
+            meta = REGISTRY.get(rule_id) or REGISTRY.resolve(rule_id)
+            raise MandatoryRuleError(
+                f"{meta['id'] if meta else rule_id} is a MISRA Mandatory guideline; "
+                f"{what} is not permitted against it. It must be fixed, not waived.")
+
     # ------------------------------------------------------------ deviations
     def add_deviation(self, rule_id: str, scope: str, justification: str,
                       approver: str = "", expires_days: float | None = None,
-                      expires_at: float | None = None) -> str:
+                      expires_at: float | None = None, source: str = "cli") -> str:
         """Record a formal deviation permit.
 
-        Raises MandatoryRuleError for MISRA Mandatory guidelines. MISRA
-        Compliance:2020 is unambiguous that Mandatory guidelines admit no
-        deviation whatsoever — the only permitted compliance state is
-        Compliant, reached by actually fixing the code. The guard lives here
-        rather than in the CLI/MCP layers so no caller can route around it.
+        Raises MandatoryRuleError for MISRA Mandatory guidelines, judged on the
+        *effective* category (so a guideline a GRP entry made Mandatory is
+        covered too). MISRA Compliance:2020 is unambiguous that Mandatory
+        guidelines admit no deviation whatsoever — the only permitted compliance
+        state is Compliant, reached by actually fixing the code. The guard lives
+        here rather than in the CLI/MCP layers so no caller can route around it.
+        Raises ValueError for a negative or already-past expiry.
         """
         from ..rules import REGISTRY
+        self._require_not_mandatory(rule_id, "deviation")
         meta = REGISTRY.get(rule_id) or REGISTRY.resolve(rule_id)
-        if meta and meta.get("category") == "mandatory":
-            raise MandatoryRuleError(
-                f"{meta['id']} is a MISRA Mandatory guideline; deviations are "
-                "not permitted against it. It must be fixed, not waived.")
+        if meta:
+            rule_id = meta["id"]
+        now = time.time()
+        if expires_days is not None and expires_days < 0:
+            raise ValueError("expires_days must not be negative.")
+        if expires_at is not None and expires_at <= now:
+            raise ValueError("The deviation's expiry is already in the past.")
         did = uuid.uuid4().hex[:12]
         expires = expires_at if expires_at is not None else (
-            time.time() + expires_days * 86400 if expires_days else None)
+            now + expires_days * 86400 if expires_days else None)
         self.db.execute(
-            "INSERT INTO deviations (id, rule_id, scope, justification, approver, expires, ts)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (did, rule_id, scope, justification, approver, expires, time.time()))
+            "INSERT INTO deviations (id, rule_id, scope, justification, approver, expires, ts,"
+            " source) VALUES (?,?,?,?,?,?,?,?)",
+            (did, rule_id, scope, justification, approver, expires, now, source))
+        self.audit("add_deviation", did, actor=approver, source=source,
+                   details={"rule_id": rule_id, "scope": scope, "justification": justification,
+                            "expires": expires}, commit=False)
         # Retroactively cover findings already on record that fall under this
         # permit's scope, so a compliance report reflects the deviation now
         # instead of only after the next rescan. (Expiry is reconciled at scan
@@ -462,42 +578,180 @@ class MemoryStore:
 
     def matching_deviation(self, rule_id: str, file: str) -> Optional[dict]:
         now = time.time()
-        for r in self.db.execute("SELECT * FROM deviations WHERE rule_id=?", (rule_id,)):
+        if self.is_mandatory(rule_id):
+            return None  # a permit on a Mandatory guideline is void, whenever it was made
+        for r in self.db.execute(
+                "SELECT * FROM deviations WHERE rule_id=? AND revoked_at IS NULL", (rule_id,)):
             if r["expires"] and r["expires"] < now:
                 continue
             if fnmatch.fnmatch(file, r["scope"]):
                 return dict(r)
         return None
 
-    def deviations(self) -> list[dict]:
-        return [dict(r) for r in self.db.execute("SELECT * FROM deviations ORDER BY ts")]
+    def deviations(self, include_revoked: bool = False) -> list[dict]:
+        q = "SELECT * FROM deviations"
+        if not include_revoked:
+            q += " WHERE revoked_at IS NULL"
+        return [dict(r) for r in self.db.execute(q + " ORDER BY ts")]
+
+    def revoke_deviation(self, deviation_id: str, revoked_by: str = "",
+                         source: str = "cli", reason: str = "") -> dict:
+        r = self.db.execute("SELECT * FROM deviations WHERE id=?", (deviation_id,)).fetchone()
+        if not r:
+            return {"error": f"No deviation with id '{deviation_id}'."}
+        if r["revoked_at"]:
+            return {"error": f"Deviation '{deviation_id}' is already revoked."}
+        self.db.execute("UPDATE deviations SET revoked_at=?, revoked_by=? WHERE id=?",
+                        (time.time(), revoked_by, deviation_id))
+        self.audit("revoke_deviation", deviation_id, actor=revoked_by, source=source,
+                   details={"rule_id": r["rule_id"], "scope": r["scope"], "reason": reason},
+                   commit=False)
+        # Findings that were deviated only by this permit go back on the books.
+        reopened = []
+        for f in self.db.execute("SELECT fingerprint, file, rule_id FROM findings"
+                                 " WHERE status='deviated' AND rule_id=?", (r["rule_id"],)).fetchall():
+            if fnmatch.fnmatch(f["file"], r["scope"]) \
+                    and not self.matching_deviation(f["rule_id"], f["file"]):
+                self.db.execute("UPDATE findings SET status='open' WHERE fingerprint=?",
+                                (f["fingerprint"],))
+                reopened.append(f["fingerprint"])
+        self.db.commit()
+        return {"ok": True, "revoked": deviation_id, "rule_id": r["rule_id"],
+                "findings_reopened": len(reopened)}
 
     # ------------------------------------------------- GRP (re-categorization)
     def add_recategorization(self, rule_id: str, to_category: str,
-                             rationale: str, approver: str = "") -> None:
+                             rationale: str, approver: str = "", source: str = "cli") -> None:
         """Record a Guideline Re-categorization Plan entry. Legality (which
-        moves MISRA permits) is enforced by the caller (engine.recategorize)."""
+        moves MISRA permits) is enforced by the caller (engine.recategorize).
+        An entry it replaces is kept in the audit log."""
+        prev = self.db.execute("SELECT * FROM recategorizations WHERE rule_id=?",
+                               (rule_id,)).fetchone()
         self.db.execute(
-            "INSERT OR REPLACE INTO recategorizations (rule_id, to_category, rationale, approver, ts)"
-            " VALUES (?,?,?,?,?)",
-            (rule_id, to_category, rationale, approver, time.time()))
+            "INSERT OR REPLACE INTO recategorizations"
+            " (rule_id, to_category, rationale, approver, ts, source) VALUES (?,?,?,?,?,?)",
+            (rule_id, to_category, rationale, approver, time.time(), source))
+        self.audit("recategorize", rule_id, actor=approver, source=source,
+                   details={"to_category": to_category, "rationale": rationale,
+                            "replaced": dict(prev) if prev else None}, commit=False)
         self.db.commit()
 
     def recategorizations(self) -> dict[str, dict]:
         return {r["rule_id"]: dict(r)
                 for r in self.db.execute("SELECT * FROM recategorizations ORDER BY rule_id")}
 
+    def remove_recategorization(self, rule_id: str, removed_by: str = "",
+                                source: str = "cli", reason: str = "") -> dict:
+        from ..rules import REGISTRY
+        meta = REGISTRY.get(rule_id) or REGISTRY.resolve(rule_id)
+        rid = meta["id"] if meta else rule_id
+        prev = self.db.execute("SELECT * FROM recategorizations WHERE rule_id=?",
+                               (rid,)).fetchone()
+        if not prev:
+            return {"error": f"No re-categorization on record for '{rule_id}'."}
+        self.db.execute("DELETE FROM recategorizations WHERE rule_id=?", (rid,))
+        self.audit("remove_recategorization", rid, actor=removed_by, source=source,
+                   details={"removed": dict(prev), "reason": reason}, commit=False)
+        self.db.commit()
+        return {"ok": True, "removed": rid, "was": prev["to_category"]}
+
     # ----------------------------------------------------------- suppressions
-    def suppress(self, fingerprint: str, reason: str) -> None:
-        self.db.execute("INSERT OR REPLACE INTO suppressions VALUES (?,?,?)",
-                        (fingerprint, reason, time.time()))
+    def suppress(self, fingerprint: str, reason: str, approver: str = "",
+                 source: str = "cli", expires_at: float | None = None,
+                 rule_id: str | None = None) -> None:
+        """Suppress one finding as a false positive.
+
+        Raises MandatoryRuleError when the finding's rule is Mandatory after GRP
+        re-categorization, and ValueError for an unknown fingerprint (unless the
+        caller names ``rule_id``, as a SARIF import does for a finding that is
+        not on record yet) or a past expiry. Replacing an earlier suppression
+        keeps the earlier reason in the audit log.
+        """
+        f = self.get_finding(fingerprint)
+        if not f and rule_id is None:
+            raise ValueError(f"No finding with fingerprint '{fingerprint}'.")
+        self._require_not_mandatory(f["rule_id"] if f else rule_id, "suppression")
+        now = time.time()
+        if expires_at is not None and expires_at <= now:
+            raise ValueError("The suppression's expiry is already in the past.")
+        prev = self.db.execute("SELECT * FROM suppressions WHERE fingerprint=?",
+                               (fingerprint,)).fetchone()
+        self.db.execute(
+            "INSERT OR REPLACE INTO suppressions"
+            " (fingerprint, reason, ts, approver, source, expires) VALUES (?,?,?,?,?,?)",
+            (fingerprint, reason, now, approver, source, expires_at))
         self.db.execute("UPDATE findings SET status='suppressed' WHERE fingerprint=?",
                         (fingerprint,))
+        self.audit("suppress", fingerprint, actor=approver, source=source,
+                   details={"rule_id": f["rule_id"] if f else rule_id, "reason": reason,
+                            "expires": expires_at,
+                            "replaced": dict(prev) if prev else None}, commit=False)
         self.db.commit()
 
     def is_suppressed(self, fingerprint: str) -> bool:
-        return self.db.execute("SELECT 1 FROM suppressions WHERE fingerprint=?",
-                               (fingerprint,)).fetchone() is not None
+        r = self.db.execute("SELECT expires FROM suppressions WHERE fingerprint=?",
+                            (fingerprint,)).fetchone()
+        return r is not None and not (r["expires"] and r["expires"] < time.time())
+
+    def suppressions(self) -> list[dict]:
+        return [dict(r) for r in self.db.execute("SELECT * FROM suppressions ORDER BY ts")]
+
+    def unsuppress(self, fingerprint: str, removed_by: str = "", source: str = "cli",
+                   reason: str = "") -> dict:
+        prev = self.db.execute("SELECT * FROM suppressions WHERE fingerprint=?",
+                               (fingerprint,)).fetchone()
+        if not prev:
+            return {"error": f"No suppression on record for '{fingerprint}'."}
+        self.db.execute("DELETE FROM suppressions WHERE fingerprint=?", (fingerprint,))
+        f = self.get_finding(fingerprint)
+        if f and f["status"] == "suppressed":
+            status = "deviated" if self.matching_deviation(f["rule_id"], f["file"]) else "open"
+            self.db.execute("UPDATE findings SET status=? WHERE fingerprint=?",
+                            (status, fingerprint))
+        self.audit("unsuppress", fingerprint, actor=removed_by, source=source,
+                   details={"removed": dict(prev), "reason": reason}, commit=False)
+        self.db.commit()
+        return {"ok": True, "unsuppressed": fingerprint}
+
+    # ------------------------------------------------------------- proposals
+    def add_proposal(self, kind: str, payload: dict, summary: str = "",
+                     source: str = "mcp") -> str:
+        pid = uuid.uuid4().hex[:12]
+        self.db.execute(
+            "INSERT INTO proposals (id, ts, kind, payload, summary, source) VALUES (?,?,?,?,?,?)",
+            (pid, time.time(), kind, json.dumps(payload), summary, source))
+        self.audit("propose_" + kind, pid, actor="", source=source,
+                   details={"summary": summary, "payload": payload}, commit=False)
+        self.db.commit()
+        return pid
+
+    @staticmethod
+    def _proposal_row(r) -> dict:
+        d = dict(r)
+        d["payload"] = json.loads(d["payload"])
+        d["result"] = json.loads(d["result"]) if d["result"] else None
+        return d
+
+    def get_proposal(self, pid: str) -> Optional[dict]:
+        r = self.db.execute("SELECT * FROM proposals WHERE id=?", (pid,)).fetchone()
+        return self._proposal_row(r) if r else None
+
+    def proposals(self, status: str | None = "pending_human") -> list[dict]:
+        q, args = "SELECT * FROM proposals", []
+        if status:
+            q += " WHERE status=?"
+            args.append(status)
+        return [self._proposal_row(r) for r in self.db.execute(q + " ORDER BY ts", args)]
+
+    def decide_proposal(self, pid: str, status: str, decided_by: str,
+                        note: str = "", result: dict | None = None) -> None:
+        self.db.execute(
+            "UPDATE proposals SET status=?, decided_by=?, decided_at=?, decision_note=?, result=?"
+            " WHERE id=?", (status, decided_by, time.time(), note,
+                            json.dumps(result, default=str) if result is not None else None, pid))
+        self.audit(f"proposal_{status}", pid, actor=decided_by, source="cli",
+                   details={"note": note, "result": result}, commit=False)
+        self.db.commit()
 
     # ----------------------------------------------------------------- notes
     def add_note(self, content: str, topic: str = "", tags: str = "") -> str:
