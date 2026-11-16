@@ -35,6 +35,7 @@ maishac rule "MISRA 21.3"         # explain a rule + cross-standard refs
 maishac session begin src/        # start an engineered fix session
 maishac session batch <id>        # next prioritized batch (JSON briefings)
 maishac session verify <id>       # rescan, diff, grade attempts, run test gate
+maishac session abort <id>        # end a session on purpose (audit-logged; ended sessions refuse batch/verify)
 maishac approve <fingerprint> --by lead@example.com
 maishac deviate "MISRA 19.2" -s "drivers/**" -j "..." --approver lead@example.com --expires 2027-01-01
 maishac suppress <fingerprint> -r "false positive: ..." --approver lead@example.com
