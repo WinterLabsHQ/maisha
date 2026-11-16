@@ -7,7 +7,6 @@ found by the benchmark/ suite (see BENCHMARK-SUITE-REPORT.md).
 """
 
 import time
-from pathlib import Path
 
 from maishac.analyzers.native import NativeAnalyzer
 from maishac.analyzers.cppcheck import CppcheckAnalyzer

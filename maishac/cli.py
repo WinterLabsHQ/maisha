@@ -355,7 +355,8 @@ def cmd_serve(args):
     try:
         from .mcp_server import main as serve_main
     except ModuleNotFoundError as e:
-        sys.exit(f"The MCP server needs the 'mcp' package (missing: {e.name}). Install it with: pip install mcp")
+        sys.exit(f"The MCP server needs the optional 'mcp' package (missing: {e.name}). "
+                 "Install it with: pip install 'maishac[mcp]'")
     serve_main()
 
 

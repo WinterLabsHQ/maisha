@@ -39,7 +39,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from ..analyzers import ALL_ANALYZERS, run_scan_detailed, available_analyzers
+from ..analyzers import ALL_ANALYZERS, run_scan_detailed
 from ..analyzers.base import validate_compiler_flags
 from ..model import relpath
 from ..memory import (TERMINAL_SESSION_STATES, MandatoryRuleError, MemoryStore,

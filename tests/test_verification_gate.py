@@ -2,7 +2,6 @@
 until a passing test run or a human confirms it (backlog §1/§5)."""
 
 import sys
-from pathlib import Path
 
 from maishac.engine import LoopEngine
 from maishac.memory import semantic_risk
@@ -92,7 +91,7 @@ def test_human_approval_resolves(tmp_path):
 def test_cannot_approve_a_still_detected_finding(tmp_path):
     proj = _proj(tmp_path, RISKY)
     eng = LoopEngine(proj)
-    sess = eng.begin_session(["src"], {"analyzers": ["native"]})
+    eng.begin_session(["src"], {"analyzers": ["native"]})
     fp = _find(eng, "15.6")["fingerprint"]
     # do NOT fix it — still open/detected
     assert "error" in eng.approve(fp, "lead-eng")

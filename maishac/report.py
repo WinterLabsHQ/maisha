@@ -632,9 +632,15 @@ def sarif(mem: MemoryStore) -> dict:
 # evidence*, not a certification — see the disclaimer in the rendered report.
 
 _MISRA_STD = "MISRA-C:2012"
-# Approx size of the full guideline set (143 rules + 16 directives + Amendment
-# 1/2/3 security rules). Used only to state honest coverage, never to score.
-_MISRA_UNIVERSE = 175
+# APPROXIMATE size of the full MISRA C:2012 guideline set: 143 rules + 16
+# directives = 159 in the base standard, plus the rules added by Amendments 1-4
+# and the Technical Corrigenda, rounded to a documented working figure. The exact
+# count depends on which amendments an organisation adopts, so every report that
+# shows it says "~". It is used only to state honest coverage ("catalogued N of
+# roughly 175"), never to score compliance. README/COVERAGE.md quote the same
+# figure; change it here and in tools/gen_coverage.py together.
+MISRA_C_2012_APPROX_GUIDELINES = 175
+_MISRA_UNIVERSE = MISRA_C_2012_APPROX_GUIDELINES
 
 
 def _coverage_breakdown() -> dict:
@@ -1031,7 +1037,6 @@ def guideline_enforcement_markdown(mem: MemoryStore, project_name: str = "") -> 
         "|---|---|---|---|---|",
     ]
     for t in gep["tools"]:
-        status = t.get("status", "available")
         mark = "**NOT INSTALLED**" if t.get("version") == "not installed" else "available"
         L.append(f"| {t['tool']} | {t['version']} | {t['options']} | {t['kind']} | {mark} |")
     if not gep["tools"]:

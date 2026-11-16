@@ -3,7 +3,7 @@
 # Maisha
 
 [![CI](https://github.com/WinterLabsHQ/maisha/actions/workflows/ci.yml/badge.svg)](https://github.com/WinterLabsHQ/maisha/actions/workflows/ci.yml)
-&nbsp;[![Release](https://img.shields.io/badge/release-v0.3.2-blue)](https://github.com/WinterLabsHQ/maisha/releases/tag/v0.3.2)
+&nbsp;[![Release](https://img.shields.io/github/v/release/WinterLabsHQ/maisha?label=release)](https://github.com/WinterLabsHQ/maisha/releases/latest)
 &nbsp;![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 &nbsp;![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
@@ -105,7 +105,7 @@ authoritative wording you still need the official MISRA / BARR / SEI CERT docume
   analysis tool *itself* to be qualified or proven-in-use; Maisha does not
   meet that bar and does not claim to.
 - **Not complete rule coverage.** 214 curated rules across three standards is a
-  fraction of MISRA C:2012 (180+ rules/directives with amendments) or CERT C.
+  fraction of MISRA C:2012 (roughly 175 rules/directives with amendments; the exact count depends on the amendments adopted) or CERT C.
   Of those, 107 are *enforced* (some analyzer detects them) and 107 are
   *reference* entries carried for cross-standard equivalence, deviation records
   and SARIF import — they are not something Maisha finds for you.

@@ -7,7 +7,6 @@ must exit non-zero so CI can gate on it.
 """
 
 import json
-import sqlite3
 import subprocess
 import sys
 
