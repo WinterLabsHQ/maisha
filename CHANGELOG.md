@@ -74,6 +74,10 @@ Read these before upgrading; each is also listed under Security/Added/Fixed/Chan
   registry cannot resolve, and `suppress` for an ambiguous one, instead of treating it as non-Mandatory.
 
 ### Security
+- **The human confirm token is hashed with scrypt, not SHA-256.** `maishac proposals set-token` now stores a
+  versioned `scrypt$n$r$p$salt$hash` record (PBKDF2-SHA256, 600000 iterations, if scrypt is unavailable) and
+  verifies it with a constant-time compare. A low-entropy token is still guessable offline by someone who can
+  read the file. A record in the earlier SHA-256 format is treated as no token: run `set-token` again.
 - **An MCP agent can no longer resolve findings by rescanning.** `LoopEngine.scan` and
   `import_sarif` force the verification gate when the engine was created for MCP, so editing code and
   calling `compliance_scan` no longer produces `resolved`/`analyzer` rows for blocker or

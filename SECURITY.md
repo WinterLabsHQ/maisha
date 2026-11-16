@@ -44,7 +44,8 @@ relevant attack surface is local, not network-facing:
 - **Hardening against an agent with a shell (raises the cost, not a boundary).**
   - `maishac proposals accept` needs a person at a terminal: stdin must be a TTY and the person
     types the proposal id. Without a TTY it is refused unless `--yes`, `MAISHAC_HUMAN=1` and
-    `MAISHAC_CONFIRM_TOKEN` are all given, and the token matches the salted hash a person
+    `MAISHAC_CONFIRM_TOKEN` are all given, and the token matches the salted scrypt hash (PBKDF2-SHA256, 600000 iterations, if scrypt is
+    unavailable) a person
     registered with `maishac proposals set-token` (stored in `~/.maishac/confirm_token.json`,
     or `$MAISHAC_USER_DIR`, outside the project). On a TTY, `--yes` with `MAISHAC_HUMAN=1`
     skips the typed prompt.
@@ -60,6 +61,9 @@ relevant attack surface is local, not network-facing:
   `maishac approve` command. The checks above make that visible and less accidental. They are
   not a defence, and the audit log is not tamper-proof. The confirm token only helps if the
   agent cannot read it: do not export `MAISHAC_CONFIRM_TOKEN` in a shell the agent shares.
+  The token is stored as a salted, deliberately slow hash, which slows offline guessing but does
+  not stop it: anyone who can read `confirm_token.json` can still guess a short or low-entropy
+  token offline. Use a long random token.
 - **SARIF import** (`maishac import`, `compliance_import_sarif`) parses
   external JSON/XML. Only import SARIF files from analyzers you trust.
 - **Project memory** (`.maishac/memory.db`) is a local SQLite file with no
