@@ -367,13 +367,25 @@ jobs:
       # Fails the build on a broken install; a narrow one only warns.
       - run: maishac doctor
 
-      - run: maishac scan src/ --include include/
+      # Gate: exit 1 on open findings, 2 if the analysis was degraded
+      # (see "CI exit codes" below). Drop --fail-on to only record results.
+      - run: maishac scan src/ --include include/ --fail-on any
       - run: maishac report --format sarif > compliance.sarif
+        if: always()
 
       # Surfaces findings in the Security tab and on the PR diff
       - uses: github/codeql-action/upload-sarif@v3
         with: { sarif_file: compliance.sarif }
 ```
+
+**CI exit codes** (`maishac scan --fail-on SEVERITY`, or `maishac gate`, which is
+`scan --fail-on any`): `1` when an open finding is at or above `SEVERITY`
+(`blocker|critical|major|minor|info`, `any` = every finding, `none` = never fail on
+findings); `2` when no finding fails the gate but the analysis was degraded (an
+analyzer crashed or timed out, or a recommended analyzer is not installed), because a
+clean result then cannot be trusted; `0` otherwise. Findings win over degradation.
+Pass `--allow-degraded` to accept a narrow toolchain. Without `--fail-on`, `scan`
+always exits 0.
 
 Because SARIF is standard, the same file works with GitLab, Azure DevOps,
 SonarQube and most code-quality dashboards.

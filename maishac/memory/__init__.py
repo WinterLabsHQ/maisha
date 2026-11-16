@@ -195,7 +195,10 @@ class MemoryStore:
         self.root = Path(project_root).resolve()
         self.dir = self.root / ".maishac"
         self.dir.mkdir(exist_ok=True)
-        self.db = sqlite3.connect(self.dir / "memory.db")
+        # check_same_thread=False: the MCP server runs tool bodies on worker
+        # threads but serializes them with a lock, so the shared connection is
+        # never used by two threads at once.
+        self.db = sqlite3.connect(self.dir / "memory.db", check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         # WAL lets a reader and a writer coexist, so a CI scan and a local
         # session on the same .maishac/memory.db don't block each other as hard.
@@ -215,6 +218,21 @@ class MemoryStore:
         self.db.executescript(_SCHEMA)
         self._migrate()
         self.db.commit()
+
+    def close(self) -> None:
+        """Close the SQLite connection. Safe to call twice."""
+        db = getattr(self, "db", None)
+        if db is not None:
+            try:
+                db.close()
+            finally:
+                self.db = None
+
+    def __enter__(self) -> "MemoryStore":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def _migrate(self) -> None:
         """Add verification-gate columns to findings tables created before they existed."""
@@ -290,16 +308,29 @@ class MemoryStore:
         known = {r["fingerprint"]: dict(r) for r in cur.fetchall()}
         scanned = {f.replace("\\", "/") for f in scanned_files}
 
+        # Read the waiver tables once per scan, not once per finding.
+        recats = {rid: r["to_category"] for rid, r in self.recategorizations().items()}
+        mandatory: dict[str, bool] = {}
+        now_ts = time.time()
+        suppressed_fps = {r["fingerprint"] for r in self.db.execute(
+            "SELECT fingerprint, expires FROM suppressions")
+            if not (r["expires"] and r["expires"] < now_ts)}
+        devs: dict[str, list[dict]] = {}
+        for r in self.db.execute("SELECT * FROM deviations WHERE revoked_at IS NULL"):
+            devs.setdefault(r["rule_id"], []).append(dict(r))
+
         for fp, f in current.items():
-            if self.is_mandatory(f.rule_id):
+            if f.rule_id not in mandatory:
+                mandatory[f.rule_id] = self.effective_category(f.rule_id, recats) == "mandatory"
+            if mandatory[f.rule_id]:
                 # A Mandatory guideline admits no waiver: any suppression or
                 # permit that predates the guard (or a later GRP move to
                 # Mandatory) is ignored, the finding stays open.
                 status = "open"
-            elif self.is_suppressed(fp):
+            elif fp in suppressed_fps:
                 diff["suppressed"].append(fp)
                 status = "suppressed"
-            elif self.matching_deviation(f.rule_id, f.file):
+            elif self._deviation_for(f.rule_id, f.file, devs, now_ts):
                 diff["deviated"].append(fp)
                 status = "deviated"
             else:
@@ -516,6 +547,16 @@ class MemoryStore:
                         (outcome, fingerprint))
         self.db.commit()
 
+    def close_pending_attempts_for_open(self, outcome: str) -> int:
+        """One UPDATE: every undecided fix attempt on a still-open (open or
+        regressed) finding gets ``outcome``."""
+        cur = self.db.execute(
+            "UPDATE fix_attempts SET outcome=? WHERE outcome='pending' AND fingerprint IN"
+            " (SELECT fingerprint FROM findings WHERE status IN ('open','regressed'))",
+            (outcome,))
+        self.db.commit()
+        return cur.rowcount
+
     def abandon_session_attempts(self, session_id: str) -> int:
         """A session ended without resolving everything: its fix attempts that
         are still undecided become 'abandoned' (and so count as failed strategies).
@@ -565,16 +606,23 @@ class MemoryStore:
         return out
 
     # ------------------------------------------------- effective categories
-    def effective_category(self, rule_id: str) -> Optional[str]:
+    def effective_category(self, rule_id: str,
+                           recats: dict[str, str] | None = None) -> Optional[str]:
         """A guideline's category after this project's GRP re-categorizations
-        (mandatory|required|advisory|disapplied), or None for an unknown rule."""
+        (mandatory|required|advisory|disapplied), or None for an unknown rule.
+        ``recats`` (rule id -> category) lets a bulk caller such as sync_scan
+        load the re-categorizations once instead of querying per call."""
         from ..rules import REGISTRY
         meta = REGISTRY.get(rule_id) or REGISTRY.resolve(rule_id)
         rid = meta["id"] if meta else rule_id
-        r = self.db.execute("SELECT to_category FROM recategorizations WHERE rule_id=?",
-                            (rid,)).fetchone()
-        if r:
-            return r["to_category"]
+        if recats is not None:
+            if rid in recats:
+                return recats[rid]
+        else:
+            r = self.db.execute("SELECT to_category FROM recategorizations WHERE rule_id=?",
+                                (rid,)).fetchone()
+            if r:
+                return r["to_category"]
         return (meta.get("category") if meta else None)
 
     def is_mandatory(self, rule_id: str) -> bool:
@@ -646,6 +694,18 @@ class MemoryStore:
                 continue
             if fnmatch.fnmatch(file, r["scope"]):
                 return dict(r)
+        return None
+
+    @staticmethod
+    def _deviation_for(rule_id: str, file: str, devs: dict[str, list[dict]],
+                       now: float) -> Optional[dict]:
+        """matching_deviation over preloaded permits (caller has already ruled
+        out Mandatory guidelines)."""
+        for r in devs.get(rule_id, []):
+            if r["expires"] and r["expires"] < now:
+                continue
+            if fnmatch.fnmatch(file, r["scope"]):
+                return r
         return None
 
     def deviations(self, include_revoked: bool = False) -> list[dict]:
@@ -822,10 +882,13 @@ class MemoryStore:
         return nid
 
     def search_notes(self, query: str, limit: int = 10) -> list[dict]:
-        like = f"%{query}%"
+        # % and _ in the query are literal characters, not LIKE wildcards.
+        esc = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{esc}%"
         return [dict(r) for r in self.db.execute(
-            "SELECT * FROM notes WHERE content LIKE ? OR topic LIKE ? OR tags LIKE ?"
-            " ORDER BY ts DESC LIMIT ?", (like, like, like, limit))]
+            "SELECT * FROM notes WHERE content LIKE ? ESCAPE '\\' OR topic LIKE ? ESCAPE '\\'"
+            " OR tags LIKE ? ESCAPE '\\' ORDER BY ts DESC LIMIT ?",
+            (like, like, like, limit))]
 
     def all_notes(self, limit: int = 50) -> list[dict]:
         return [dict(r) for r in self.db.execute(

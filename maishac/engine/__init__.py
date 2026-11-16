@@ -162,6 +162,49 @@ def validate_analyzer_names(names) -> str:
     return ""
 
 
+FAIL_ON_CHOICES = [*_SEV_ORDER, "any", "none"]
+
+# CI gate exit codes (`maishac scan --fail-on ...`, `maishac gate`).
+EXIT_OK, EXIT_FINDINGS, EXIT_DEGRADED = 0, 1, 2
+
+
+def gate_verdict(result: dict, fail_on: str, allow_degraded: bool = False) -> dict:
+    """Turn a scan() result into a CI verdict.
+
+    ``fail_on`` is a severity (blocker|critical|major|minor|info: fail when an
+    open finding of that severity or worse exists), ``any`` (any open finding,
+    same as ``info``) or ``none`` (never fail on findings, only on a degraded
+    analysis). Exit codes: 1 findings at/above the threshold; 2 the analysis was
+    degraded (an analyzer failed or crashed, or a recommended analyzer is not
+    installed) and ``allow_degraded`` is False; 0 otherwise. Findings win over
+    degradation: they are real whatever else is missing, whereas a degraded run
+    only makes a clean result untrustworthy, so a failing build never reads as
+    "tool problem" when it actually has violations."""
+    if fail_on not in FAIL_ON_CHOICES:
+        raise ValueError(f"Unknown --fail-on '{fail_on}'. Valid: {', '.join(FAIL_ON_CHOICES)}.")
+    counts = result.get("open_by_severity", {})
+    if fail_on == "none":
+        blocking = 0
+    else:
+        floor = "info" if fail_on == "any" else fail_on
+        blocking = sum(counts.get(sev, 0) for sev in _severities_at_or_above(floor))
+    errors = result.get("analyzer_errors") or []
+    toolchain = result.get("toolchain") or {}
+    degraded = bool(errors or toolchain.get("degraded"))
+    if blocking:
+        code, why = EXIT_FINDINGS, (
+            f"{blocking} open finding(s) at or above '{fail_on}'.")
+    elif degraded and not allow_degraded:
+        code, why = EXIT_DEGRADED, (
+            "analysis degraded: " + ("; ".join(f"{e['analyzer']} {e['status']}" for e in errors)
+                                     if errors else "a recommended analyzer is not installed")
+            + ". A clean result cannot be trusted (pass --allow-degraded to accept it).")
+    else:
+        code, why = EXIT_OK, "gate passed."
+    return {"fail_on": fail_on, "allow_degraded": allow_degraded, "exit_code": code,
+            "blocking_findings": blocking, "degraded": degraded, "reason": why}
+
+
 def _severities_at_or_above(floor: str) -> list[str]:
     idx = _SEV_ORDER.index(floor) if floor in _SEV_ORDER else 3
     return _SEV_ORDER[: idx + 1]
@@ -172,6 +215,16 @@ class LoopEngine:
         self.root = Path(project_root).resolve()
         self.mem = MemoryStore(self.root)
         self.source = source   # cli|mcp: recorded on every audited action
+
+    def close(self) -> None:
+        """Release the project's SQLite connection."""
+        self.mem.close()
+
+    def __enter__(self) -> "LoopEngine":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     # ------------------------------------------------------------------ scan
     def scan(self, paths: list[str], analyzers: list[str] | None = None,
@@ -212,13 +265,16 @@ class LoopEngine:
         from ..coverage import toolchain_snapshot
         self.mem.record_scan(kind, list(paths), len(scanned), used, errors,
                              toolchain_snapshot(tc), bool(tc["degraded"] or errors))
+        open_rows = self.mem.open_findings(limit=100000)
         out = {
             "analyzers_used": used,
             "files_scanned": len(scanned),
             "total_findings": len(findings),
             "diff": {k: len(v) for k, v in diff.items()},
-            "open": len(self.mem.open_findings(limit=100000)),
-            "open_imported": sum(_is_imported(f) for f in self.mem.open_findings(limit=100000)),
+            "open": len(open_rows),
+            "open_imported": sum(_is_imported(f) for f in open_rows),
+            "open_by_severity": {sev: sum(f["severity"] == sev for f in open_rows)
+                                 for sev in _SEV_ORDER},
             "pending_verification": self.mem.count_pending(),
             "toolchain": tc,
             "analyzer_errors": errors,
@@ -845,8 +901,7 @@ class LoopEngine:
         prev_open = history[-1]["open"] if history else open_now
 
         # close pending attempts on findings that persist
-        for f in self.mem.open_findings(limit=100000):
-            self.mem.close_pending_attempts(f["fingerprint"], "persisting")
+        self.mem.close_pending_attempts_for_open("persisting")
 
         # verification gate: a fix that merely silenced the analyzer is NOT
         # resolved until a passing test run or a human confirms it.

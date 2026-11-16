@@ -23,7 +23,15 @@ All notable changes to Maisha are documented here. Format loosely follows
   the next scan.
 
 ### Added
-- `maishac session abort <id>` / `compliance_abort_session` / `LoopEngine.abort_session`
+- **CI gate.** `maishac scan --fail-on <blocker|critical|major|minor|info|any|none>` (and
+  the alias `maishac gate`, default `any`) exits 1 when open findings are at or above the
+  threshold, and 2 when the analysis was degraded (an analyzer failed, or a recommended
+  one is not installed) unless `--allow-degraded`. Findings take precedence over
+  degradation. Without `--fail-on`, `scan` still exits 0. The scan JSON gains
+  `open_by_severity` and, with the flag, a `gate` block.
+- `MemoryStore.close()` / context manager and `LoopEngine.close()`; the CLI closes its
+  connections. `maishac --project` must be an existing directory.
+- `session abort <id>` / `compliance_abort_session` / `LoopEngine.abort_session`
   end a session on purpose (audit-logged `session_end`, undecided fix attempts marked
   `abandoned`). `session begin --severity-floor`. Sessions can end as `needs_human`
   when every remaining finding is frozen by the oscillation guard.
@@ -42,6 +50,12 @@ All notable changes to Maisha are documented here. Format loosely follows
   recategorizations, `approval_source` on findings, `proposals` and `audit_log` tables.
 
 ### Fixed
+- The CLI reports expected errors (unknown session id, invalid argument) as `error: ...`
+  with exit 1 instead of a traceback; `scan --analyzers` tolerates spaces.
+- `search_notes` / `memory_search` treat `%` and `_` literally instead of as LIKE wildcards.
+- Performance: `sync_scan` loads suppressions, deviations and re-categorizations once per
+  scan instead of querying per finding, and `verify` closes pending fix attempts with a
+  single UPDATE. Behaviour is unchanged.
 - **Finding lifecycle:** a `regressed` finding that is still present stays `regressed`;
   a `pending_verification` finding that comes back counts as a regression (so the
   oscillation freeze works under gated policies) and marks its fix attempts
@@ -62,6 +76,10 @@ All notable changes to Maisha are documented here. Format loosely follows
   before, so existing fingerprints stay valid).
 
 ### Changed
+- **MCP server:** tool bodies run on a worker thread (serialized by a lock) so a long scan
+  no longer blocks the event loop. Path arguments (`paths`, `include_paths`, `exclude`,
+  `compile_commands`, `-I` flags, SARIF `path`) must stay inside the project root unless
+  the server is started with `MAISHAC_ALLOW_OUTSIDE_PROJECT=1`.
 - `REGISTRY.resolve` is exact: no more substring fallback, so `deviate "misra"` or
   `deviate "21"` fail with a helpful message instead of binding to some rule;
   `MISRA Dir 4.1` no longer resolves to Rule 4.1, and a bare number matching both a

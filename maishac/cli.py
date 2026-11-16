@@ -2,6 +2,8 @@
 
     maishac doctor                        diagnose install, toolchain and coverage
     maishac scan src/                     scan + sync memory
+    maishac scan src/ --fail-on major     CI gate: exit 1 on findings, 2 if degraded
+    maishac gate src/                     same as scan --fail-on any
     maishac guide "dynamic memory"        author-time: the compliant idiom to reach for
     maishac check draft.c                 lint a draft in memory (no store); '-' = stdin
     maishac findings --limit 20           list open findings
@@ -33,13 +35,19 @@ import time
 from pathlib import Path
 
 from . import __version__
-from .engine import LoopEngine
+from .engine import FAIL_ON_CHOICES, LoopEngine, gate_verdict
 from .rules import REGISTRY
 from . import report as report_mod
 
 
+# Engines opened by the running command; main() closes them when it finishes.
+_OPEN_ENGINES: list[LoopEngine] = []
+
+
 def _engine(args) -> LoopEngine:
-    return LoopEngine(getattr(args, "project", None) or os.getcwd())
+    eng = LoopEngine(getattr(args, "project", None) or os.getcwd())
+    _OPEN_ENGINES.append(eng)
+    return eng
 
 
 def _print(obj) -> None:
@@ -73,6 +81,20 @@ def _scan_options(args) -> dict:
             "compile_commands": args.compile_commands}
 
 
+def _add_gate_options(s, default_fail_on: str | None) -> None:
+    s.add_argument("--fail-on", choices=FAIL_ON_CHOICES, default=default_fail_on,
+                   metavar="SEVERITY",
+                   help="CI gate. Exit 1 if an open finding is at or above SEVERITY "
+                        "(blocker|critical|major|minor|info; 'any' = every open finding; "
+                        "'none' = never fail on findings). Exit 2 if no findings fail but the "
+                        "analysis was degraded (an analyzer failed, or a recommended one is "
+                        "not installed) unless --allow-degraded. Findings take precedence "
+                        "over degradation. Without this flag scan always exits 0."
+                        + (" Default for 'gate': any." if default_fail_on else ""))
+    s.add_argument("--allow-degraded", action="store_true",
+                   help="With --fail-on: do not exit 2 for a degraded analysis.")
+
+
 def _add_scan_options(s) -> None:
     s.add_argument("--include", "-I", action="append",
                    help="Include dir forwarded to cppcheck/clang-tidy/the compiler as -I "
@@ -94,13 +116,22 @@ def _add_scan_options(s) -> None:
 
 def cmd_scan(args):
     eng = _engine(args)
-    result = eng.scan(args.paths, args.analyzers.split(",") if args.analyzers else None,
-                      **_scan_options(args))
+    analyzers = ([a.strip() for a in args.analyzers.split(",") if a.strip()]
+                 if args.analyzers else None)
+    result = eng.scan(args.paths, analyzers, **_scan_options(args))
     if "error" in result:
         print(result["error"], file=sys.stderr)
         sys.exit(1)
+    verdict = None
+    if args.fail_on:
+        verdict = gate_verdict(result, args.fail_on, args.allow_degraded)
+        result["gate"] = verdict
     _print(result)
     _warn_coverage(result)
+    if verdict:
+        print(f"gate: {verdict['reason']} (exit {verdict['exit_code']})", file=sys.stderr)
+        if verdict["exit_code"]:
+            sys.exit(verdict["exit_code"])
 
 
 def cmd_check(args):
@@ -339,6 +370,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("paths", nargs="+")
     s.add_argument("--analyzers", help="Comma list: native,cppcheck,clang-tidy,compiler")
     _add_scan_options(s)
+    _add_gate_options(s, None)
+    s.set_defaults(fn=cmd_scan)
+
+    s = sub.add_parser("gate", help="CI gate: scan, then exit 1 on open findings, 2 on a "
+                                    "degraded analysis (alias of 'scan --fail-on any')")
+    s.add_argument("paths", nargs="+")
+    s.add_argument("--analyzers", help="Comma list: native,cppcheck,clang-tidy,compiler")
+    _add_scan_options(s)
+    _add_gate_options(s, "any")
     s.set_defaults(fn=cmd_scan)
 
     s = sub.add_parser("findings", help="List open findings")
@@ -498,7 +538,20 @@ def main(argv: list[str] | None = None) -> None:
             except Exception:  # noqa: BLE001 — never let output-hardening itself crash the CLI
                 pass
     args = build_parser().parse_args(argv)
-    args.fn(args)
+    project = getattr(args, "project", None)
+    if project and not Path(project).is_dir():
+        print(f"error: --project '{project}' is not an existing directory.", file=sys.stderr)
+        sys.exit(1)
+    try:
+        args.fn(args)
+    except ValueError as e:
+        # Expected user errors (unknown session, invalid argument, refused
+        # sign-off) are a message and exit 1, never a traceback.
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        while _OPEN_ENGINES:
+            _OPEN_ENGINES.pop().close()
 
 
 if __name__ == "__main__":

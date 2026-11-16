@@ -155,8 +155,11 @@ def test_mcp_tools_in_process(tmp_path, monkeypatch):
         assert m.compliance_report(fmt)
 
     # SARIF import through the tool
-    imp = json.loads(m.compliance_import_sarif(
-        str(REPO / "benchmark" / "synthetic_qualified_engine.sarif.json")))
+    # (paths outside the project root are refused, so the file is copied in)
+    sarif_in = proj / "qualified.sarif.json"
+    sarif_in.write_text(
+        (REPO / "benchmark" / "synthetic_qualified_engine.sarif.json").read_text("utf-8"))
+    imp = json.loads(m.compliance_import_sarif(str(sarif_in)))
     assert imp["imported"] >= 1
 
 

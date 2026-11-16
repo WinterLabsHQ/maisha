@@ -30,6 +30,7 @@ CLI entry point (`maishac`, defined in `maishac/cli.py`):
 ```bash
 maishac doctor                    # diagnose install, toolchain, reachable rules
 maishac scan src/                 # one-shot scan, syncs memory
+maishac scan src/ --fail-on major # CI gate: exit 1 on findings, 2 if degraded (--allow-degraded); `maishac gate` = --fail-on any
 maishac findings --limit 20       # ranked open findings
 maishac rule "MISRA 21.3"         # explain a rule + cross-standard refs
 maishac session begin src/        # start an engineered fix session
