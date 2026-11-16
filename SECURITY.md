@@ -2,15 +2,18 @@
 
 ## Supported Versions
 
-Maisha is pre-1.0 (current release: `0.1.0`) and does not yet maintain
-parallel supported release lines. Security fixes are made against `main` and
-shipped in the next release.
+Maisha is pre-1.0 (current release: `0.5.0`) and maintains one supported
+release line. Security fixes are made against `main` and shipped in the next
+release of the latest minor version.
 
 | Version         | Supported          |
-| --------------- | ------------------- |
+| --------------- | ------------------ |
 | `main` (latest) | :white_check_mark: |
-| `0.1.0`         | :white_check_mark: |
-| < `0.1.0`       | :x:                 |
+| `0.5.x`         | :white_check_mark: |
+| < `0.5.0`       | :x:                |
+
+Releases before 0.5.0 lack the provenance tracking and human-accept gate
+described under Scope below. Upgrade rather than wait for a backport.
 
 Once Maisha reaches 1.0, this table will track supported minor lines and this
 policy will be updated accordingly.

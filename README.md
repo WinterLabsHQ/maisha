@@ -346,6 +346,9 @@ on: [pull_request]
 jobs:
   maisha:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # required by upload-sarif
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -355,7 +358,7 @@ jobs:
       - run: maishac scan src/ --include include/ --fail-on major
       - run: maishac report --format sarif > maisha.sarif
         if: always()
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@v4
         if: always()
         with: { sarif_file: maisha.sarif }
 ```

@@ -378,6 +378,9 @@ on: [push, pull_request]
 jobs:
   misra:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # required by upload-sarif
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -396,7 +399,7 @@ jobs:
         if: always()
 
       # Surfaces findings in the Security tab and on the PR diff
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@v4
         with: { sarif_file: compliance.sarif }
 ```
 
