@@ -341,6 +341,20 @@ def compliance_session_status(session_id: str) -> str:
 
 
 @mcp.tool()
+def compliance_abort_session(session_id: str, reason: str = "") -> str:
+    """End a session on purpose (for example when the user changes plans). Its
+    undecided fix attempts are marked abandoned and the end is audit-logged. A
+    session that already ended cannot be aborted, and an ended session accepts no
+    further next_batch, verify or record_attempt calls.
+
+    Args:
+        session_id: Session id from compliance_begin_session.
+        reason: Why it is being aborted (kept in the audit log).
+    """
+    return _j(_engine().abort_session(session_id, reason, by="agent"))
+
+
+@mcp.tool()
 def compliance_import_sarif(path: str) -> str:
     """Import findings from an external SARIF 2.1.0 file into project memory, so
     a qualified/certified engine's output (Helix QAC, Polyspace, Parasoft,

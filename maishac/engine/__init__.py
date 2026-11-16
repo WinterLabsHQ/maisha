@@ -39,10 +39,11 @@ import subprocess
 import time
 from pathlib import Path
 
-from ..analyzers import run_scan_detailed, available_analyzers
+from ..analyzers import ALL_ANALYZERS, run_scan_detailed, available_analyzers
 from ..analyzers.base import validate_compiler_flags
 from ..model import relpath
-from ..memory import MandatoryRuleError, MemoryStore
+from ..memory import (TERMINAL_SESSION_STATES, MandatoryRuleError, MemoryStore,
+                      requires_human)
 from ..rules import REGISTRY
 
 DEFAULT_CONFIG = {
@@ -138,6 +139,27 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 _VALID_POLICIES = ("analyzer_only", "test_gated", "human_gated")
 
 _SEV_ORDER = ["blocker", "critical", "major", "minor", "info"]
+ANALYZER_NAMES = [cls.name for cls in ALL_ANALYZERS]
+
+
+def _is_imported(f: dict) -> bool:
+    """A finding that came from an imported SARIF file only (native rescans
+    cannot judge it, so it never counts toward a session's convergence)."""
+    parts = (f.get("analyzer") or "").split("+")
+    return bool(f.get("analyzer")) and all(a.startswith("sarif:") for a in parts)
+
+
+def validate_analyzer_names(names) -> str:
+    """Error message for an unknown analyzer name, or ''."""
+    if names is None:
+        return ""
+    if isinstance(names, str) or not all(isinstance(n, str) for n in names):
+        return f"analyzers must be a list of names (valid: {', '.join(ANALYZER_NAMES)})."
+    bad = [n for n in names if n not in ANALYZER_NAMES]
+    if bad:
+        return (f"Unknown analyzer(s): {', '.join(bad)}. "
+                f"Valid names: {', '.join(ANALYZER_NAMES)}.")
+    return ""
 
 
 def _severities_at_or_above(floor: str) -> list[str]:
@@ -157,16 +179,29 @@ class LoopEngine:
              exclude: list[str] | None = None, default_excludes: bool = True,
              std: str | None = None, compiler_flags: list[str] | None = None,
              compile_commands: str | None = None, kind: str = "scan") -> dict:
+        err = validate_analyzer_names(analyzers)
+        if err:
+            return {"error": err}
         flags = validate_compiler_flags(compiler_flags)
         options = {"std": std, "compiler_flags": flags, "compile_commands": compile_commands}
         sr = run_scan_detailed(paths, self.root, analyzers, include_paths,
                                exclude, default_excludes, options)
+        if not sr.files:
+            # Zero files means zero evidence. Syncing it would report "0 open"
+            # and let a session converge on a typo'd path.
+            return {"error": "No C source files (.c/.h) were found under "
+                             f"{', '.join(map(str, paths)) or '(no paths)'}; nothing was scanned, "
+                             "so no result can be given. Check the paths and exclude patterns.",
+                    "files_scanned": 0}
         findings = sr.findings
         used = sr.analyzers_used
         scanned = [relpath(f, self.root) for f in sr.files]
         # Only files an analyzer really analyzed can have findings cleared by
         # it: a crashed/timed-out/non-compiling run must never look like a fix.
-        diff = self.mem.sync_scan(findings, scanned, gate=gate, analyzed=sr.analyzed)
+        # Findings in files that have since been deleted are closed as stale.
+        removed = {f for f in self.mem.tracked_files() if not (self.root / f).exists()}
+        diff = self.mem.sync_scan(findings, scanned, gate=gate, analyzed=sr.analyzed,
+                                  removed_files=removed)
         # Every scan states what it could NOT check. Without this a native-only
         # run returns a clean result indistinguishable from a full-toolchain
         # clean result, which silently overstates compliance.
@@ -183,6 +218,7 @@ class LoopEngine:
             "total_findings": len(findings),
             "diff": {k: len(v) for k, v in diff.items()},
             "open": len(self.mem.open_findings(limit=100000)),
+            "open_imported": sum(_is_imported(f) for f in self.mem.open_findings(limit=100000)),
             "pending_verification": self.mem.count_pending(),
             "toolchain": tc,
             "analyzer_errors": errors,
@@ -194,7 +230,19 @@ class LoopEngine:
             out["coverage_warning"] = "\n".join(warnings)
         return out
 
-    def import_sarif(self, path: str | Path, carry_suppressions: bool = True) -> dict:
+    def _resolve_input_path(self, path: str | Path) -> Path:
+        """A relative path is looked up under the project root first (as the tool
+        docs say), then under the current directory."""
+        p = Path(path)
+        if p.is_absolute():
+            return p
+        for base in (self.root, Path.cwd()):
+            if (base / p).exists():
+                return base / p
+        return self.root / p      # not found anywhere: report the project-relative path
+
+    def import_sarif(self, path: str | Path, carry_suppressions: bool = True,
+                     gate: bool = True) -> dict:
         """Ingest findings from an external SARIF file (e.g. a qualified engine
         like Helix QAC / Polyspace, or cppcheck's own --sarif output) into the
         same memory/loop/gate machinery as a native scan. Imported findings are
@@ -203,9 +251,16 @@ class LoopEngine:
         SARIF ``result.suppressions`` are honored: a finding the engine already
         marked suppressed/baselined is imported as *suppressed* (with its
         justification preserved) rather than resurfacing as a fresh violation —
-        this is how a team brings its existing triage across."""
+        this is how a team brings its existing triage across.
+
+        Re-importing a newer file from the same tool is how imported findings get
+        resolved: one that is absent from the new import, in a file the new run
+        covers, is cleared (``pending_verification`` when ``gate`` is True, so a
+        person still confirms it with ``approve``; ``resolved`` otherwise).
+        Findings of other tools, and files the run does not mention, are left alone."""
         from .. import report as report_mod
-        data = json.loads(Path(path).read_text("utf-8"))
+        src = self._resolve_input_path(path)
+        data = json.loads(src.read_text("utf-8"))
         findings = report_mod.parse_sarif(data, self.root)
         # Pre-record incoming suppressions so sync_scan buckets them as
         # suppressed instead of new/open (bring-your-own-triage).
@@ -223,7 +278,9 @@ class LoopEngine:
                                   approver="sarif-import", source="import",
                                   rule_id=f.rule_id)
                 carried += 1
-        diff = self.mem.sync_scan(findings, [], producers=set())
+        scope = report_mod.sarif_scope(data, self.root)
+        covered = set().union(*scope.values()) if scope else set()
+        diff = self.mem.sync_scan(findings, sorted(covered), gate=gate, analyzed=scope)
         tools = sorted({f.analyzer for f in findings})
         # Imports run no analyzer here, so there is no toolchain to snapshot;
         # the row records provenance only and is not an analysis run.
@@ -554,9 +611,83 @@ class LoopEngine:
         return self.mem.proposals(status)
 
     # --------------------------------------------------------------- session
+    @staticmethod
+    def _validate_session_config(cfg: dict) -> str:
+        """Error message for an unusable session setting, or ''."""
+        paths = cfg.get("paths")
+        if not paths or not isinstance(paths, (list, tuple)) or not all(
+                isinstance(p, str) and p for p in paths):
+            return "paths must be a non-empty list of file or directory paths."
+        err = validate_analyzer_names(cfg.get("analyzers"))
+        if err:
+            return err
+        policy = cfg.get("verification_policy")
+        if policy is not None and policy not in _VALID_POLICIES:
+            return (f"Unknown verification_policy '{policy}'. "
+                    f"Valid: {', '.join(_VALID_POLICIES)}.")
+        if cfg.get("severity_floor") not in _SEV_ORDER:
+            return (f"Unknown severity_floor '{cfg.get('severity_floor')}'. "
+                    f"Valid: {', '.join(_SEV_ORDER)}.")
+        for key in ("max_iterations", "batch_size", "stall_limit", "oscillation_limit"):
+            v = cfg.get(key)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                return f"{key} must be a positive integer (got {v!r})."
+        return ""
+
+    def _scope_prefixes(self, cfg: dict) -> list[str] | None:
+        """Project-relative POSIX prefixes of the session's paths; None = everything."""
+        out: list[str] = []
+        for p in cfg.get("paths") or ["."]:
+            pth = Path(p) if Path(p).is_absolute() else self.root / p
+            rel = relpath(pth, self.root).rstrip("/")
+            if rel in (".", ""):
+                return None
+            out.append(rel)
+        return out
+
+    @staticmethod
+    def _in_paths(file: str, prefixes: list[str] | None) -> bool:
+        if prefixes is None:
+            return True
+        return any(file == p or file.startswith(p + "/") for p in prefixes)
+
+    def _in_scope(self, f: dict, cfg: dict, prefixes) -> bool:
+        return (f["severity"] in _severities_at_or_above(cfg.get("severity_floor", "minor"))
+                and self._in_paths(f["file"], prefixes))
+
+    def _open_split(self, cfg: dict) -> dict:
+        """Open findings split by how they bear on this session: ``in_scope`` (native
+        findings at/above the severity floor under the session paths: these decide
+        convergence), ``imported`` (SARIF-imported, not clearable by a native rescan)
+        and ``out_of_scope`` (below the floor or outside the paths)."""
+        prefixes = self._scope_prefixes(cfg)
+        in_scope, imported, out = [], [], []
+        for f in self.mem.open_findings(limit=100000):
+            if _is_imported(f):
+                imported.append(f)
+            elif self._in_scope(f, cfg, prefixes):
+                in_scope.append(f)
+            else:
+                out.append(f)
+        return {"in_scope": in_scope, "imported": imported, "out_of_scope": out}
+
+    def _terminal_error(self, sess: dict, action: str) -> dict | None:
+        if sess["status"] in TERMINAL_SESSION_STATES:
+            return {"error": f"Session {sess['id']} has ended ({sess['status']}); {action} is "
+                             "not allowed on it. Start a new session with begin_session.",
+                    "session_id": sess["id"], "state": sess["status"]}
+        return None
+
     def begin_session(self, paths: list[str], config: dict | None = None,
                       force: bool = False) -> dict:
-        cfg = {**DEFAULT_CONFIG, **(config or {}), "paths": paths}
+        # an unset (None) option keeps its default rather than blanking it
+        cfg = {**DEFAULT_CONFIG,
+               **{k: v for k, v in (config or {}).items()
+                  if not (v is None and DEFAULT_CONFIG.get(k) is not None)},
+               "paths": paths}
+        err = self._validate_session_config(cfg)
+        if err:
+            return {"error": err}
         # The test command runs on the host, so it comes only from human-controlled
         # places: the CLI flag, MAISHAC_TEST_COMMAND, or .maishac/config.json.
         # The MCP tools have no way to set it.
@@ -574,21 +705,31 @@ class LoopEngine:
         if cfg["test_timeout"] <= 0:
             return {"error": "test_timeout must be a positive number of seconds."}
         # Guard against two sessions racing on the same .maishac/memory.db
-        # (e.g. a CI job and a local run). They'd fight over finding state.
-        existing = self.mem.latest_active_session()
-        if existing and not force:
+        # (e.g. a CI job and a local run). They'd fight over finding state. The
+        # check and the insert are one transaction, so both cannot win; the row
+        # is reserved before the (slow) baseline scan.
+        sid, existing = self.mem.create_session_if_free(cfg, force)
+        if sid is None:
             return {"error": "A session is already active on this project "
                              f"({existing['id']}). Resume it (session_status/next_batch), "
                              "or pass force to start a fresh one anyway.",
                     "active_session_id": existing["id"]}
-        baseline = self.scan(paths, cfg.get("analyzers"), **self._scan_kwargs(cfg))
-        sid = self.mem.create_session(cfg)
+        try:
+            baseline = self.scan(cfg["paths"], cfg.get("analyzers"), **self._scan_kwargs(cfg))
+        except BaseException:
+            self.mem.delete_session(sid)
+            raise
+        if "error" in baseline:
+            self.mem.delete_session(sid)     # never started: leave no live session behind
+            return {"error": baseline["error"]}
         self.mem.audit("session_start", sid, source=self.source,
                        details={"paths": paths, "verification_policy": self._policy(cfg),
                                 "test_command_configured": bool(cfg.get("test_command"))})
+        split = self._open_split(cfg)
         self.mem.update_session(sid, history=[{
             "iteration": 0, "event": "baseline",
-            "open": baseline["open"], "ts": time.time(),
+            "open": len(split["in_scope"]), "open_imported": len(split["imported"]),
+            "ts": time.time(),
         }])
         out = {
             "session_id": sid,
@@ -611,9 +752,14 @@ class LoopEngine:
 
     def next_batch(self, session_id: str) -> dict:
         sess = self._require(session_id)
+        err = self._terminal_error(sess, "next_batch")
+        if err:
+            return err
         cfg = sess["config"]
+        prefixes = self._scope_prefixes(cfg)
         sevs = _severities_at_or_above(cfg.get("severity_floor", "minor"))
-        opens = self.mem.open_findings(limit=500, severities=sevs)
+        opens = [f for f in self.mem.open_findings(limit=500, severities=sevs)
+                 if self._in_paths(f["file"], prefixes)]
 
         # freeze oscillating findings
         frozen, workable = [], []
@@ -652,21 +798,51 @@ class LoopEngine:
 
     def record_attempt(self, session_id: str, fingerprint: str,
                        strategy: str, notes: str = "") -> dict:
-        self._require(session_id)
+        err = self._terminal_error(self._require(session_id), "record_attempt")
+        if err:
+            return err
         aid = self.mem.record_fix_attempt(fingerprint, session_id, strategy, notes)
         return {"attempt_id": aid, "fingerprint": fingerprint, "recorded": True}
 
+    def abort_session(self, session_id: str, reason: str = "", by: str = "") -> dict:
+        """End a session on purpose. Its undecided fix attempts are marked
+        abandoned and the end is audit-logged. A session that already ended
+        cannot be aborted."""
+        sess = self._require(session_id)
+        if sess["status"] in TERMINAL_SESSION_STATES:
+            return {"error": f"Session {session_id} has already ended ({sess['status']}).",
+                    "session_id": session_id, "state": sess["status"]}
+        reason = (reason or "").strip() or "aborted on request"
+        self.mem.update_session(session_id, status="aborted", end_reason=reason)
+        abandoned = self.mem.abandon_session_attempts(session_id)
+        self.mem.audit("session_end", session_id, actor=by, source=self.source,
+                       details={"state": "aborted", "iteration": sess["iteration"],
+                                "reason": reason, "attempts_abandoned": abandoned})
+        return {"session_id": session_id, "state": "aborted", "reason": reason,
+                "attempts_abandoned": abandoned}
+
     def verify(self, session_id: str) -> dict:
         sess = self._require(session_id)
+        err = self._terminal_error(sess, "verify")   # awaiting_verification is not terminal
+        if err:
+            return err
         cfg = sess["config"]
         policy = self._policy(cfg)
         result = self.scan(cfg["paths"], cfg.get("analyzers"), gate=policy != "analyzer_only",
                            kind="verify", **self._scan_kwargs(cfg))
+        if "error" in result:
+            return {"session_id": session_id, "state": sess["status"], "error": result["error"]}
         analyzer_errors = result["analyzer_errors"]
         iteration = sess["iteration"] + 1
         history = sess["history"]
-        prev_open = history[-1]["open"] if history else result["open"]
-        open_now = result["open"]
+        split = self._open_split(cfg)
+        # Convergence is judged on native findings inside the session's severity
+        # floor and paths. Imported findings (a native rescan cannot clear them)
+        # and findings outside the scope are counted and reported, not blocking.
+        open_now = len(split["in_scope"])
+        open_imported = len(split["imported"])
+        open_out = len(split["out_of_scope"])
+        prev_open = history[-1]["open"] if history else open_now
 
         # close pending attempts on findings that persist
         for f in self.mem.open_findings(limit=100000):
@@ -680,20 +856,25 @@ class LoopEngine:
             if test_run.get("passed"):
                 confirmed_by_test = self.mem.confirm_pending_by_test()
 
-        pending = self.mem.count_pending()
-        awaiting_human = self.mem.count_pending(require_human=True)
+        prefixes = self._scope_prefixes(cfg)
+        pending_rows = [f for f in self.mem.pending_findings() if self._in_scope(f, cfg, prefixes)]
+        pending = len(pending_rows)
+        awaiting_human = sum(requires_human(f) for f in pending_rows)
         history.append({"iteration": iteration, "event": "verify", "open": open_now,
-                        "pending": pending, "diff": result["diff"], "ts": time.time()})
+                        "open_imported": open_imported, "pending": pending,
+                        "diff": result["diff"], "ts": time.time()})
 
+        frozen_now = [f for f in split["in_scope"]
+                      if f["regress_count"] >= cfg.get("oscillation_limit", 2)]
         state, reason = "active", ""
-        budget_spent = iteration >= cfg.get("max_iterations", 10)
+        max_iter = cfg.get("max_iterations", 10)
         if analyzer_errors and open_now == 0:
             # An analyzer that failed cannot vouch for anything, so "no open
             # findings" is not evidence of compliance: never converge on it.
             names = ", ".join(sorted({e["analyzer"] for e in analyzer_errors}))
-            if budget_spent:
+            if iteration >= max_iter:
                 state = "budget_exhausted"
-                reason = (f"Iteration budget ({cfg['max_iterations']}) reached while "
+                reason = (f"Iteration budget ({max_iter}) reached while "
                           f"{names} was still failing or only partly running; the "
                           "analysis is incomplete, so this is NOT a compliant result.")
             else:
@@ -718,23 +899,47 @@ class LoopEngine:
             state = "awaiting_verification"
             reason = ("Analyzer-clean, but the fixes are UNVERIFIED — "
                       + "; ".join(need) + ". They do not count as resolved until confirmed.")
-        elif iteration >= cfg.get("max_iterations", 10):
-            state, reason = "budget_exhausted", f"Iteration budget ({cfg['max_iterations']}) reached."
+        elif len(frozen_now) == open_now:
+            # every remaining finding keeps coming back: more iterations only thrash
+            state = "needs_human"
+            reason = (f"{open_now} open finding(s) regressed {cfg.get('oscillation_limit', 2)} or "
+                      "more times and are frozen: fixing them keeps being undone. A person must "
+                      "decide (change approach, deviate with justification, or fix by hand).")
+        elif iteration >= max_iter:
+            state, reason = "budget_exhausted", f"Iteration budget ({max_iter}) reached."
         else:
-            recent = [h for h in history if h["event"] == "verify"][-cfg.get("stall_limit", 2):]
-            if len(recent) >= cfg.get("stall_limit", 2) and all(
-                    h["open"] >= prev for h, prev in
-                    zip(recent, [prev_open] + [r["open"] for r in recent[:-1]])):
-                # no verify in the window reduced the open count
-                if all(h["open"] >= history[max(0, len(history) - len(recent) - 1)]["open"]
-                       for h in recent):
+            limit = cfg.get("stall_limit", 2)
+            verifies = [i for i, h in enumerate(history) if h["event"] == "verify"]
+            if len(verifies) >= limit:
+                # open count just before the window of `limit` verifies, vs now
+                start_open = history[max(0, verifies[-limit] - 1)]["open"]
+                if open_now >= start_open:
                     state, reason = "stalled", (
-                        "No net progress across recent iterations. Escalate to a human, "
+                        f"No net progress across the last {limit} iterations "
+                        f"({start_open} open before, {open_now} now). Escalate to a human, "
                         "add deviations for justified findings, or change approach.")
 
-        self.mem.update_session(session_id, status=state if state != "active" else "active",
-                                iteration=iteration, history=history)
-        if state in ("converged", "budget_exhausted", "stalled"):
+        if state == "converged":
+            notes = []
+            if open_imported:
+                notes.append(
+                    f"{open_imported} imported finding(s) are still open (open_imported): "
+                    "a native rescan cannot clear them. They did not block convergence; "
+                    "resolve them by re-importing a newer SARIF from the same tool, or "
+                    "by approve/suppress/deviate.")
+            if open_out:
+                notes.append(
+                    f"{open_out} open finding(s) are outside this session's severity floor "
+                    "or paths and were not part of it.")
+            if notes:
+                reason += " " + " ".join(notes)
+
+        ending = state in TERMINAL_SESSION_STATES
+        self.mem.update_session(session_id, status=state, iteration=iteration, history=history,
+                                end_reason=reason if ending else None)
+        if ending:
+            if state != "converged":
+                self.mem.abandon_session_attempts(session_id)
             self.mem.audit("session_end", session_id, source=self.source,
                            details={"state": state, "iteration": iteration, "reason": reason})
         return {
@@ -745,6 +950,8 @@ class LoopEngine:
             "verification_policy": policy,
             "open_before": prev_open,
             "open_now": open_now,
+            "open_imported": open_imported,
+            "open_out_of_scope": open_out,
             "pending_verification": pending,
             "awaiting_human_approval": awaiting_human,
             "confirmed_by_test": confirmed_by_test,
@@ -754,15 +961,17 @@ class LoopEngine:
             "analysis_complete": result["analysis_complete"],
             **({"coverage_warning": result["coverage_warning"]}
                if result.get("coverage_warning") else {}),
-            "pending_findings": self._brief_many(self.mem.pending_findings()),
+            "pending_findings": self._brief_many(pending_rows),
             "regressions": self._brief_many(
-                [f for f in self.mem.open_findings(limit=100) if f["status"] == "regressed"]),
+                [f for f in split["in_scope"] if f["status"] == "regressed"]),
+            "frozen_needs_human": self._brief_many(frozen_now),
             "next": ("Session complete." if state == "converged"
                      else "Approve verified fixes (approve_finding) or call next_batch."
                      if state == "awaiting_verification"
                      else "Fix the analyzer failure (see analyzer_errors) and call verify again."
                      if state == "analysis_incomplete"
                      else "Call next_batch for the next set of findings." if state == "active"
+                     else "A person must review the frozen findings." if state == "needs_human"
                      else "Session ended."),
         }
 

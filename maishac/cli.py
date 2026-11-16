@@ -9,6 +9,7 @@
     maishac session begin src/            start an engineered fix session
     maishac session batch <id>            next prioritized batch (JSON)
     maishac session verify <id>           rescan + converge check
+    maishac session abort <id>            end a session (audit-logged)
     maishac deviate "MISRA 21.6" -s "src/debug/*" -j "..."
     maishac suppress <fingerprint> -r "false positive because ..."
     maishac note "Use pool_alloc() instead of malloc" -t allocator
@@ -95,6 +96,9 @@ def cmd_scan(args):
     eng = _engine(args)
     result = eng.scan(args.paths, args.analyzers.split(",") if args.analyzers else None,
                       **_scan_options(args))
+    if "error" in result:
+        print(result["error"], file=sys.stderr)
+        sys.exit(1)
     _print(result)
     _warn_coverage(result)
 
@@ -174,19 +178,22 @@ def cmd_session(args):
         args.paths = paths or ["."]
         out = eng.begin_session(args.paths, {
             "max_iterations": args.max_iterations, "batch_size": args.batch_size,
+            "severity_floor": args.severity_floor,
             "verification_policy": args.verification_policy,
             "test_command": args.test_command, "test_timeout": args.test_timeout,
             **_scan_options(args)}, force=args.force)
-        _print(out)
+        _emit(out)
         _warn_coverage(out)
     elif args.action == "batch":
-        _print(eng.next_batch(args.session_id))
+        _emit(eng.next_batch(args.session_id))
     elif args.action == "verify":
         out = eng.verify(args.session_id)
-        _print(out)
+        _emit(out)
         _warn_coverage(out)
     elif args.action == "status":
         _print(eng.session_status(args.session_id))
+    elif args.action == "abort":
+        _emit(eng.abort_session(args.session_id, args.reason or "", args.by or ""))
 
 
 def cmd_approve(args):
@@ -371,11 +378,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_rule)
 
     s = sub.add_parser("session", help="Engineered fix-loop sessions")
-    s.add_argument("action", choices=["begin", "batch", "verify", "status"])
+    s.add_argument("action", choices=["begin", "batch", "verify", "status", "abort"])
     s.add_argument("session_id", nargs="?")
     s.add_argument("paths", nargs="*")
     s.add_argument("--max-iterations", type=int, default=10)
     s.add_argument("--batch-size", type=int, default=5)
+    s.add_argument("--severity-floor", choices=["blocker", "critical", "major", "minor", "info"],
+                   default="minor",
+                   help="Ignore findings below this severity for convergence (default minor).")
+    s.add_argument("--reason", help="(abort) why the session is being ended.")
+    s.add_argument("--by", help="(abort) who is ending it, for the audit log.")
     s.add_argument("--verification-policy",
                    choices=["analyzer_only", "test_gated", "human_gated"],
                    help="How a fix is confirmed resolved (default: test_gated if "

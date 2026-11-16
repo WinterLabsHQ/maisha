@@ -126,12 +126,14 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
-  status TEXT NOT NULL DEFAULT 'active',   -- active|converged|budget_exhausted|aborted|stalled|awaiting_verification|analysis_incomplete
+  status TEXT NOT NULL DEFAULT 'active',   -- active|awaiting_verification|analysis_incomplete (live) | converged|budget_exhausted|stalled|needs_human|aborted (terminal)
   iteration INTEGER NOT NULL DEFAULT 0,
   config TEXT,
   history TEXT,          -- JSON list of iteration snapshots (open counts per iteration)
   started REAL NOT NULL,
-  updated REAL NOT NULL
+  updated REAL NOT NULL,
+  ended REAL,            -- when the session reached a terminal state
+  end_reason TEXT        -- why it ended (the verify reason, or the abort reason)
 );
 CREATE TABLE IF NOT EXISTS scans (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -180,7 +182,12 @@ CREATE INDEX IF NOT EXISTS idx_attempts_fp ON fix_attempts(fingerprint);
 #   2: findings."column", scans table
 #   3: source/approver/expiry on suppressions, source + revocation on deviations,
 #      source on recategorizations, findings.approval_source, audit_log, proposals
-SCHEMA_VERSION = 3
+#   4: sessions.ended / sessions.end_reason (session lifecycle: abort, needs_human)
+SCHEMA_VERSION = 4
+
+# Session states that end a session for good. Everything else (active,
+# awaiting_verification, analysis_incomplete) can still be verified.
+TERMINAL_SESSION_STATES = ("converged", "budget_exhausted", "stalled", "needs_human", "aborted")
 
 
 class MemoryStore:
@@ -224,7 +231,8 @@ class MemoryStore:
                                   ("expires", "REAL")]),
                 ("deviations", [("source", "TEXT NOT NULL DEFAULT 'cli'"),
                                 ("revoked_at", "REAL"), ("revoked_by", "TEXT")]),
-                ("recategorizations", [("source", "TEXT NOT NULL DEFAULT 'cli'")])):
+                ("recategorizations", [("source", "TEXT NOT NULL DEFAULT 'cli'")]),
+                ("sessions", [("ended", "REAL"), ("end_reason", "TEXT")])):
             have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             for name, ddl in additions:
                 if name not in have:
@@ -237,7 +245,8 @@ class MemoryStore:
     # ------------------------------------------------------------ scan sync
     def sync_scan(self, findings: list[Finding], scanned_files: list[str],
                   gate: bool = False, producers: set[str] | None = None,
-                  analyzed: dict[str, set[str]] | None = None) -> dict:
+                  analyzed: dict[str, set[str]] | None = None,
+                  removed_files: set[str] | None = None) -> dict:
         """Reconcile a fresh scan against memory.
 
         Returns a diff: {new, persisting, resolved, pending, regressed, suppressed,
@@ -262,14 +271,24 @@ class MemoryStore:
         its file, and none of the producers that took part failed to analyze
         it. A crashed tool, a timeout or a file that did not compile therefore
         never resolves anything.
+
+        ``removed_files`` are files on record that no longer exist on disk. The
+        open findings in them are closed as stale (resolved, verification method
+        ``file_removed``) and listed under ``stale`` in the diff: the code is
+        gone, so no analyzer judgement or sign-off is needed.
+
+        Lifecycle: a finding that reappears after being resolved *or* after
+        being pending_verification is a regression (counted, so the oscillation
+        freeze works under gated policies); one that is already ``regressed``
+        and still present stays ``regressed``.
         """
         now = time.time()
         current = {f.fingerprint: f for f in findings}
         diff = {k: [] for k in ("new", "persisting", "resolved", "pending",
-                                 "regressed", "suppressed", "deviated")}
+                                 "regressed", "suppressed", "deviated", "stale")}
         cur = self.db.execute("SELECT * FROM findings")
         known = {r["fingerprint"]: dict(r) for r in cur.fetchall()}
-        scanned = set(scanned_files)
+        scanned = {f.replace("\\", "/") for f in scanned_files}
 
         for fp, f in current.items():
             if self.is_mandatory(f.rule_id):
@@ -300,23 +319,44 @@ class MemoryStore:
                     diff["new"].append(fp)
             else:
                 prev = known[fp]
-                # 'resolved' coming back is a regression; a reappearing 'pending'
-                # (never confirmed) or 'open' is just still-open.
-                regressed = prev["status"] == "resolved" and status == "open"
-                new_status = "regressed" if regressed else status
+                # A finding that was resolved, or that the analyzer had stopped
+                # flagging (pending_verification), and is flagged again, did not
+                # stay fixed: that is a regression. One already 'regressed' stays
+                # so until it is resolved; it is not downgraded to plain 'open'.
+                regressed = (status == "open"
+                             and prev["status"] in ("resolved", "pending_verification"))
+                still_regressed = status == "open" and prev["status"] == "regressed"
+                new_status = "regressed" if (regressed or still_regressed) else status
                 self.db.execute(
                     """UPDATE findings SET status=?, line=?, "column"=?,
                        seen_count=seen_count+1, last_seen=?,
-                       regress_count=regress_count+? WHERE fingerprint=?""",
-                    (new_status, f.line, f.column, now, 1 if regressed else 0, fp))
+                       regress_count=regress_count+?,
+                       analyzer_cleared_at=CASE WHEN ? THEN NULL ELSE analyzer_cleared_at END
+                       WHERE fingerprint=?""",
+                    (new_status, f.line, f.column, now, 1 if regressed else 0,
+                     1 if regressed else 0, fp))
                 if regressed:
                     diff["regressed"].append(fp)
+                    # the fixes tried on it did not hold
+                    self.db.execute(
+                        "UPDATE fix_attempts SET outcome='regressed' "
+                        "WHERE fingerprint=? AND outcome IN ('pending','resolved')", (fp,))
                 elif status == "open":
                     diff["persisting"].append(fp)
 
         # anything known-open in a scanned file but absent now => cleared by the analyzer
         for fp, prev in known.items():
             if fp in current:
+                continue
+            if (removed_files and prev["file"] in removed_files
+                    and prev["status"] in ("open", "regressed", "pending_verification")):
+                self.db.execute(
+                    "UPDATE findings SET status='resolved', resolved_at=?, "
+                    "verification_method='file_removed' WHERE fingerprint=?", (now, fp))
+                self.db.execute(
+                    "UPDATE fix_attempts SET outcome='resolved' "
+                    "WHERE fingerprint=? AND outcome='pending'", (fp,))
+                diff["stale"].append(fp)
                 continue
             if analyzed is not None:
                 took_part = [a for a in (prev["analyzer"] or "").split("+") if a in analyzed]
@@ -343,6 +383,14 @@ class MemoryStore:
                     diff["resolved"].append(fp)
         self.db.commit()
         return diff
+
+    def tracked_files(self) -> set[str]:
+        """Files with an unresolved finding that Maisha's own analyzers produced
+        (imported findings are excluded: their files may live on another machine)."""
+        return {r["file"] for r in self.db.execute(
+            "SELECT file, analyzer FROM findings WHERE status IN"
+            " ('open','regressed','pending_verification') AND file != ''")
+            if not all(a.startswith("sarif:") for a in (r["analyzer"] or "").split("+"))}
 
     # ----------------------------------------------------------------- scans
     def record_scan(self, kind: str, paths: list[str], files_scanned: int,
@@ -467,6 +515,18 @@ class MemoryStore:
         self.db.execute("UPDATE fix_attempts SET outcome=? WHERE fingerprint=? AND outcome='pending'",
                         (outcome, fingerprint))
         self.db.commit()
+
+    def abandon_session_attempts(self, session_id: str) -> int:
+        """A session ended without resolving everything: its fix attempts that
+        are still undecided become 'abandoned' (and so count as failed strategies).
+        Attempts on findings that are only awaiting verification are left alone,
+        since the fix may still be confirmed."""
+        cur = self.db.execute(
+            "UPDATE fix_attempts SET outcome='abandoned' WHERE session_id=? AND outcome='pending'"
+            " AND fingerprint NOT IN (SELECT fingerprint FROM findings"
+            "  WHERE status IN ('pending_verification','resolved'))", (session_id,))
+        self.db.commit()
+        return cur.rowcount
 
     def attempts_for(self, fingerprint: str) -> list[dict]:
         return [dict(r) for r in self.db.execute(
@@ -790,12 +850,47 @@ class MemoryStore:
         d["history"] = json.loads(d["history"] or "[]")
         return d
 
+    def create_session_if_free(self, config: dict, force: bool = False) -> tuple[str | None, dict | None]:
+        """Atomically check for an active session and create a new one.
+
+        Returns (session_id, None) or (None, existing_active_session). The check
+        and the insert share one write transaction (BEGIN IMMEDIATE), so two
+        processes starting a session at once cannot both succeed."""
+        self.db.commit()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            r = self.db.execute("SELECT id FROM sessions WHERE status='active'"
+                                " ORDER BY started DESC LIMIT 1").fetchone()
+            if r and not force:
+                self.db.execute("ROLLBACK")
+                return None, self.get_session(r["id"])
+            sid = uuid.uuid4().hex[:12]
+            now = time.time()
+            self.db.execute("INSERT INTO sessions (id, config, history, started, updated)"
+                            " VALUES (?,?,?,?,?)", (sid, json.dumps(config), "[]", now, now))
+            self.db.execute("COMMIT")
+            return sid, None
+        except BaseException:
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            raise
+
+    def delete_session(self, sid: str) -> None:
+        """Drop a session that never started (its baseline scan failed)."""
+        self.db.execute("DELETE FROM sessions WHERE id=?", (sid,))
+        self.db.commit()
+
     def update_session(self, sid: str, *, status: str | None = None,
                        iteration: int | None = None,
-                       history: list | None = None) -> None:
+                       history: list | None = None,
+                       end_reason: str | None = None) -> None:
         sets, args = ["updated=?"], [time.time()]
         if status is not None:
             sets.append("status=?"); args.append(status)
+            if status in TERMINAL_SESSION_STATES:
+                sets.append("ended=?"); args.append(time.time())
+        if end_reason is not None:
+            sets.append("end_reason=?"); args.append(end_reason)
         if iteration is not None:
             sets.append("iteration=?"); args.append(iteration)
         if history is not None:

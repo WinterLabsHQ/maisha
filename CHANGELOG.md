@@ -23,6 +23,16 @@ All notable changes to Maisha are documented here. Format loosely follows
   the next scan.
 
 ### Added
+- `maishac session abort <id>` / `compliance_abort_session` / `LoopEngine.abort_session`
+  end a session on purpose (audit-logged `session_end`, undecided fix attempts marked
+  `abandoned`). `session begin --severity-floor`. Sessions can end as `needs_human`
+  when every remaining finding is frozen by the oscillation guard.
+- Re-importing a newer SARIF file from the same tool resolves the imported findings
+  that are gone from it (to `pending_verification` by default, so a person still
+  confirms with `approve`), limited to that tool and the files its run covers.
+- Findings in files that were deleted are closed as stale (`resolved`, verification
+  method `file_removed`; `stale` in the scan diff). Schema v4 adds
+  `sessions.ended` / `sessions.end_reason` (migrates in place).
 - Append-only `audit_log` (every approval, suppression, deviation,
   re-categorization, revocation, proposal decision, session start/end), `maishac audit`,
   and an audit section in the markdown report. Entries from agents are marked.
@@ -30,6 +40,26 @@ All notable changes to Maisha are documented here. Format loosely follows
   approver, source and optional expiry (`--approver`, `--expires`, `--expires-days`).
 - Schema v3 (migrates in place): `source` on suppressions/deviations/
   recategorizations, `approval_source` on findings, `proposals` and `audit_log` tables.
+
+### Fixed
+- **Finding lifecycle:** a `regressed` finding that is still present stays `regressed`;
+  a `pending_verification` finding that comes back counts as a regression (so the
+  oscillation freeze works under gated policies) and marks its fix attempts
+  `regressed`. Attempts of a session that ends unresolved become `abandoned`.
+- **Sessions:** verify respects the session's severity floor and paths (findings
+  outside are reported as `open_out_of_scope`, imported ones as `open_imported`; neither
+  blocks convergence). A scan that finds zero files is an error, never `converged`.
+  Settings are validated (analyzer names, policy, floor, positive integers). Ended
+  sessions refuse `next_batch`/`verify`/`record_attempt`. `begin_session` checks for an
+  active session and creates one in a single transaction. Stall detection compares the
+  open count at the start of the window with now.
+- **SARIF import:** the file path is resolved against the project root (then the current
+  directory); `file` URIs (`file://`, percent-encoding, backslashes, absolute paths
+  inside the project) normalize to one project-relative POSIX path, used for both
+  `file` and the fingerprint.
+- **Fingerprints** use forward slashes on every OS. Identical violating lines in one
+  function are separate findings (occurrence index; occurrence 0 hashes exactly as
+  before, so existing fingerprints stay valid).
 
 ### Changed
 - `REGISTRY.resolve` is exact: no more substring fallback, so `deviate "misra"` or

@@ -48,10 +48,18 @@ def _normalize_line(line: str) -> str:
 
 
 def compute_fingerprint(rule_id: str, rel_path: str, line_content: str,
-                        context_symbol: str = "") -> str:
+                        context_symbol: str = "", occurrence: int = 0) -> str:
     """Stable identity of a defect: rule + file + normalized offending line +
-    enclosing symbol. Deliberately excludes the line *number*."""
-    payload = "\x1f".join([rule_id, rel_path, _normalize_line(line_content), context_symbol])
+    enclosing symbol. Deliberately excludes the line *number*.
+
+    ``occurrence`` tells apart the nth identical violating line in the same
+    function. Occurrence 0 hashes exactly as it did before the argument
+    existed, so every fingerprint already on record stays valid.
+    """
+    fields = [rule_id, rel_path, _normalize_line(line_content), context_symbol]
+    if occurrence:
+        fields.append(str(int(occurrence)))
+    payload = "\x1f".join(fields)
     return hashlib.sha1(payload.encode("utf-8", "replace")).hexdigest()[:16]
 
 
@@ -74,6 +82,8 @@ class Finding:
     suppression: dict = field(default_factory=dict)  # {justification, kind} if an imported SARIF result was already suppressed/baselined
 
     def __post_init__(self) -> None:
+        # Identity must not depend on the OS: always forward slashes.
+        self.file = self.file.replace("\\", "/")
         if not self.fingerprint:
             self.fingerprint = compute_fingerprint(
                 self.rule_id, self.file, self.line_content, self.context_symbol
@@ -86,6 +96,41 @@ class Finding:
     def from_dict(d: dict) -> "Finding":
         known = {f for f in Finding.__dataclass_fields__}  # type: ignore[attr-defined]
         return Finding(**{k: v for k, v in d.items() if k in known})
+
+
+def assign_occurrences(findings: list["Finding"]) -> list["Finding"]:
+    """Give identical violations their own identity.
+
+    Two findings of the same rule on identical (whitespace-normalized) lines in
+    the same function of one file hash to the same fingerprint, so fixing one
+    would look like fixing both. Within one analyzer run, the nth such finding
+    (in line order) gets occurrence n folded into its fingerprint. Occurrence 0
+    keeps the legacy fingerprint. Repeats on the very same line are one
+    finding, as before. Only fingerprints Maisha computed itself are touched;
+    ones supplied by an external tool are kept verbatim.
+
+    Returns the findings with exact repeats removed, in their original order.
+    """
+    groups: dict[str, list[Finding]] = {}
+    for f in findings:
+        base = compute_fingerprint(f.rule_id, f.file, f.line_content, f.context_symbol)
+        if f.fingerprint == base:
+            groups.setdefault(base, []).append(f)
+    drop: set[int] = set()
+    for base, members in groups.items():
+        order = sorted(members, key=lambda f: (f.line, f.column))
+        places: list[int] = []
+        for f in order:
+            place = f.line
+            if place in places:
+                drop.add(id(f))
+                continue
+            places.append(place)
+            n = len(places) - 1
+            if n:
+                f.fingerprint = compute_fingerprint(f.rule_id, f.file, f.line_content,
+                                                    f.context_symbol, n)
+    return [f for f in findings if id(f) not in drop]
 
 
 _CTRL_LEAD_RE = re.compile(r"^\s*(if|for|while|switch|else|do)\b")
@@ -147,10 +192,12 @@ def enclosing_function(lines: list[str], idx: int) -> str:
 
 
 def relpath(path: str | Path, root: str | Path) -> str:
+    """Project-relative path with forward slashes on every OS, so a fingerprint
+    computed on Windows equals the one computed on Linux."""
     try:
-        return str(Path(path).resolve().relative_to(Path(root).resolve()))
+        return Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
     except ValueError:
-        return str(path)
+        return Path(path).as_posix()
 
 
 def jdump(obj) -> str:

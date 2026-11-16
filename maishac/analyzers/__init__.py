@@ -10,7 +10,7 @@ from .native import NativeAnalyzer
 from .cppcheck import CppcheckAnalyzer
 from .clang_tidy import ClangTidyAnalyzer
 from .compiler import CompilerAnalyzer
-from ..model import Finding
+from ..model import Finding, assign_occurrences
 
 ALL_ANALYZERS: list[type[Analyzer]] = [NativeAnalyzer, CppcheckAnalyzer,
                                        ClangTidyAnalyzer, CompilerAnalyzer]
@@ -87,6 +87,9 @@ def run_scan_detailed(paths: list[str], root: Path,
         except Exception as e:  # noqa: BLE001 — an analyzer bug must not look like a clean run
             res = AnalysisResult.failure(an.name, files, root,
                                          f"{type(e).__name__}: {e}")
+        # identical violating lines in one function get their own identity;
+        # per analyzer, so two tools reporting the same line still merge below
+        res.findings = assign_occurrences(res.findings)
         results.append(res)
         for fnd in res.findings:
             key = fnd.fingerprint

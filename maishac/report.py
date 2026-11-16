@@ -10,14 +10,16 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import posixpath
 import re
 import time
 from pathlib import Path
+from urllib.parse import unquote
 
 from . import __version__
 from .analyzers.cppcheck import CPPCHECK_TO_CERT
 from .memory import MemoryStore
-from .model import Finding, compute_fingerprint, relpath
+from .model import Finding, assign_occurrences, compute_fingerprint
 from .rules import REGISTRY
 
 _STANDARDS = ["MISRA-C:2012", "BARR-C:2018", "CERT-C"]
@@ -56,19 +58,32 @@ def _resolve_sarif_rule(rule_id: str) -> dict | None:
     return None
 
 
-def _norm_uri(uri: str) -> str:
-    """Normalize a SARIF artifactLocation URI to a project-relative-ish path:
-    strip file:// schemes and leading ./ so fingerprints and file lookups are
-    stable across engines that emit absolute/scheme-prefixed URIs."""
+def _norm_uri(uri: str, root: Path | None = None) -> str:
+    """Normalize a SARIF artifactLocation URI to a project-relative POSIX path:
+    strip ``file://``, percent-decode, turn backslashes into slashes, drop a
+    leading ``./``, and make an absolute path inside ``root`` relative to it.
+    The result is the one value used for both a finding's ``file`` and its
+    fingerprint, so it is identical whatever form the engine emitted."""
     if not uri:
         return ""
-    if uri.startswith("file://"):
-        uri = uri[7:]
-        if len(uri) > 2 and uri[0] == "/" and uri[2] == ":":  # file:///C:/...
-            uri = uri[1:]
+    if uri.startswith("file:"):
+        uri = uri[5:]
+        if uri.startswith("//"):
+            uri = uri[2:]
+            if not uri.startswith("/"):      # file://host/path -> drop the authority
+                uri = "/" + uri.split("/", 1)[1] if "/" in uri else ""
+    uri = unquote(uri).replace("\\", "/")
+    if len(uri) > 2 and uri[0] == "/" and uri[2] == ":":  # /C:/... from file:///C:/...
+        uri = uri[1:]
+    if root is not None and (uri.startswith("/") or (len(uri) > 1 and uri[1] == ":")):
+        try:
+            return Path(uri).resolve().relative_to(Path(root).resolve()).as_posix()
+        except (ValueError, OSError):
+            pass
+    uri = posixpath.normpath(uri) if uri else ""
     while uri.startswith("./"):
         uri = uri[2:]
-    return uri
+    return "" if uri == "." else uri
 
 
 def _run_indexes(run: dict) -> tuple[list[dict], list[list[dict]]]:
@@ -155,7 +170,7 @@ def parse_sarif(data: dict, root: Path) -> list[Finding]:
 
             desc = _result_descriptor(res, rules)
             phys = _primary_location(res)
-            uri = _norm_uri((phys.get("artifactLocation") or {}).get("uri") or "")
+            uri = _norm_uri((phys.get("artifactLocation") or {}).get("uri") or "", root)
             region = phys.get("region") or {}
             line = int(region.get("startLine") or 0)
             col = int(region.get("startColumn") or 0)
@@ -183,7 +198,7 @@ def parse_sarif(data: dict, root: Path) -> list[Finding]:
             fp = (res.get("partialFingerprints") or {}).get("maishac/v1")
             if not fp:
                 if line_content:
-                    fp = compute_fingerprint(rid, relpath(root / uri, root), line_content)
+                    fp = compute_fingerprint(rid, uri, line_content)
                 else:
                     # ponytail: no source line to anchor to — fall back to a
                     # location+message hash. Not line-stable, but external SARIF
@@ -198,7 +213,28 @@ def parse_sarif(data: dict, root: Path) -> list[Finding]:
                 column=col, message=msg, analyzer=f"sarif:{tool}",
                 line_content=line_content, fix_hint=fix, fingerprint=fp,
                 code_flow=_parse_code_flows(res), suppression=_parse_suppression(res)))
-    return findings
+    return assign_occurrences(findings)
+
+
+def sarif_scope(data: dict, root: Path) -> dict[str, set[str]]:
+    """tool name (``sarif:<driver>``) -> project-relative files its run covers:
+    every artifact it lists and every file any of its results (even one a
+    baseline marks absent) points at. A re-import may only resolve findings in
+    these files; a file the run never mentions was simply not analyzed."""
+    out: dict[str, set[str]] = {}
+    for run in data.get("runs", []):
+        driver = (run.get("tool") or {}).get("driver") or {}
+        files = out.setdefault(f"sarif:{(driver.get('name') or 'sarif').lower()}", set())
+        for art in run.get("artifacts") or []:
+            uri = _norm_uri(((art.get("location") or {}).get("uri")) or "", root)
+            if uri:
+                files.add(uri)
+        for res in run.get("results", []):
+            uri = _norm_uri((_primary_location(res).get("artifactLocation") or {})
+                            .get("uri") or "", root)
+            if uri:
+                files.add(uri)
+    return out
 
 
 def _parse_suppression(res: dict) -> dict:
