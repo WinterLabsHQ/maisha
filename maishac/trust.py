@@ -10,7 +10,7 @@ Accepting an agent proposal (`maishac proposals accept`) needs one of:
 1. an interactive terminal: stdin is a TTY and the person types the proposal id;
 2. no TTY (CI, scripts): ``--yes`` AND ``MAISHAC_HUMAN=1`` AND a confirm token.
    The token is set once by a person on a terminal with
-   ``maishac proposals set-token``; only its salted hash is stored, in the
+   ``maishac proposals set-token``; only a salted scrypt hash is stored, in the
    user's own directory (``~/.maishac/``, or ``MAISHAC_USER_DIR``), not in the
    project. It is supplied through ``MAISHAC_CONFIRM_TOKEN``.
 
@@ -43,18 +43,65 @@ def _token_path() -> Path:
     return user_dir() / "confirm_token.json"
 
 
-def _digest(token: str, salt: str) -> str:
-    return hashlib.sha256((salt + token).encode("utf-8")).hexdigest()
+_SCRYPT = (2**14, 8, 1)  # n, r, p
+_PBKDF2_ITERATIONS = 600_000
+_REHASH_HINT = "run `maishac proposals set-token` again"
+
+
+def _kdf(token: str, scheme: str, params: tuple[int, ...], salt: bytes) -> bytes:
+    data = token.encode("utf-8")
+    if scheme == "scrypt":
+        n, r, p = params
+        return hashlib.scrypt(data, salt=salt, n=n, r=r, p=p, dklen=32,
+                              maxmem=128 * n * r * 2 + (1 << 20))
+    if scheme == "pbkdf2":
+        return hashlib.pbkdf2_hmac("sha256", data, salt, params[0], dklen=32)
+    raise ValueError("unknown scheme")
+
+
+def _hash_token(token: str) -> str:
+    """-> ``scheme$params$salt_hex$hash_hex``; scrypt, or PBKDF2 when scrypt is missing."""
+    salt = secrets.token_bytes(16)
+    try:
+        h = _kdf(token, "scrypt", _SCRYPT, salt)
+        return "scrypt$" + "$".join(str(x) for x in _SCRYPT) + f"${salt.hex()}${h.hex()}"
+    except (AttributeError, ValueError, MemoryError):  # scrypt not in this OpenSSL build
+        h = _kdf(token, "pbkdf2", (_PBKDF2_ITERATIONS,), salt)
+        return f"pbkdf2${_PBKDF2_ITERATIONS}${salt.hex()}${h.hex()}"
+
+
+def _parse_record(record: object) -> tuple[str, tuple[int, ...], bytes, bytes]:
+    """Parse a stored record; raise ValueError for anything not in the current format."""
+    if not isinstance(record, str):
+        raise ValueError("not a record")
+    parts = record.split("$")
+    if parts[0] == "scrypt" and len(parts) == 6:
+        params = tuple(int(x) for x in parts[1:4])
+    elif parts[0] == "pbkdf2" and len(parts) == 4:
+        params = (int(parts[1]),)
+    else:
+        raise ValueError("unrecognised record")
+    salt, digest = bytes.fromhex(parts[-2]), bytes.fromhex(parts[-1])
+    if len(salt) < 16 or len(digest) != 32 or min(params) < 1:
+        raise ValueError("malformed record")
+    return parts[0], params, salt, digest
+
+
+def _load_record() -> tuple[str, tuple[int, ...], bytes, bytes] | None:
+    try:
+        d = json.loads(_token_path().read_text("utf-8"))
+        return _parse_record(d.get("hash"))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
 
 
 def set_confirm_token(token: str) -> Path:
-    """Store the salted hash of ``token`` for non-interactive accepts."""
+    """Store a salted scrypt (or PBKDF2) hash of ``token`` for non-interactive accepts."""
     if len(token) < 8:
         raise ValueError("the confirm token must be at least 8 characters.")
-    salt = secrets.token_hex(16)
     path = _token_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"salt": salt, "sha256": _digest(token, salt)}), "utf-8")
+    path.write_text(json.dumps({"hash": _hash_token(token)}), "utf-8")
     try:
         path.chmod(0o600)
     except OSError:
@@ -63,18 +110,18 @@ def set_confirm_token(token: str) -> Path:
 
 
 def token_configured() -> bool:
-    try:
-        d = json.loads(_token_path().read_text("utf-8"))
-        return bool(d.get("salt") and d.get("sha256"))
-    except (OSError, ValueError):
-        return False
+    """True only for a valid record in the current format; an old one counts as none."""
+    return _load_record() is not None
 
 
 def verify_confirm_token(token: str) -> bool:
+    rec = _load_record()
+    if rec is None:
+        return False
+    scheme, params, salt, digest = rec
     try:
-        d = json.loads(_token_path().read_text("utf-8"))
-        return hmac.compare_digest(_digest(token or "", d["salt"]), d["sha256"])
-    except (OSError, ValueError, KeyError, TypeError):
+        return hmac.compare_digest(_kdf(token or "", scheme, params, salt), digest)
+    except (ValueError, AttributeError, MemoryError):
         return False
 
 
@@ -123,8 +170,9 @@ def confirm_accept(pid: str, summary: str, yes: bool) -> tuple[dict | None, str]
                       f"{TOKEN_ENV} set to the token registered with "
                       "`maishac proposals set-token`.")
     if not token_configured():
-        return None, ("No confirm token is registered. A person must run "
-                      "`maishac proposals set-token` in an interactive shell first.")
+        return None, ("No valid confirm token is registered (a token from an older format is "
+                      "not accepted). A person must run `maishac proposals set-token` "
+                      "in an interactive shell first.")
     if not verify_confirm_token(os.environ.get(TOKEN_ENV, "")):
         return None, f"{TOKEN_ENV} is missing or does not match the registered token."
     return actor_context("token"), ""

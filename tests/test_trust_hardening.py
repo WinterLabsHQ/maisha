@@ -126,6 +126,47 @@ def test_confirm_token_is_stored_hashed(proj):
         trust.set_confirm_token("short")
 
 
+def test_token_record_format_is_versioned_kdf(proj):
+    import json
+
+    path = trust.set_confirm_token("s3cret-token")
+    rec = json.loads(path.read_text())["hash"]
+    assert rec.startswith(("scrypt$16384$8$1$", "pbkdf2$"))
+    assert "s3cret-token" not in rec
+    assert trust.token_configured()
+    assert trust.verify_confirm_token("s3cret-token")
+    assert not trust.verify_confirm_token("s3cret-tokeN")
+    assert not trust.verify_confirm_token("")
+
+
+def test_pbkdf2_fallback_when_scrypt_missing(proj, monkeypatch):
+    monkeypatch.delattr(trust.hashlib, "scrypt")
+    path = trust.set_confirm_token("s3cret-token")
+    assert "pbkdf2$600000$" in path.read_text()
+    assert trust.verify_confirm_token("s3cret-token")
+    assert not trust.verify_confirm_token("wrong-token")
+
+
+def test_old_sha256_record_is_rejected_cleanly(proj, monkeypatch):
+    import hashlib
+    import json
+
+    path = trust._token_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    salt = "ab" * 16
+    old = hashlib.sha256((salt + "s3cret-token").encode()).hexdigest()
+    path.write_text(json.dumps({"salt": salt, "sha256": old}))
+    assert not trust.token_configured()
+    assert not trust.verify_confirm_token("s3cret-token")
+    path.write_text("not json")
+    assert not trust.token_configured()
+    monkeypatch.setattr(trust, "_is_tty", lambda: False)
+    monkeypatch.setenv(trust.HUMAN_ENV, "1")
+    monkeypatch.setenv(trust.TOKEN_ENV, "s3cret-token")
+    ctx, why = trust.confirm_accept("p1", "x", True)
+    assert ctx is None and "set-token" in why
+
+
 def test_reject_and_agent_approval_optout_unaffected(proj, monkeypatch):
     pid, _ = _proposal(proj)
     _tty(monkeypatch, False)
