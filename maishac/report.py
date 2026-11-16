@@ -384,9 +384,12 @@ def _expired(d: dict, now: float | None = None) -> bool:
 
 def _mark(row: dict) -> str:
     """Flag a sign-off that did not come from a person at the CLI."""
-    src = (row.get("source") or row.get("approval_source") or "cli")
+    src = (row.get("source") or row.get("approval_source")
+           or ("legacy" if row.get("approved_by") else "cli"))
     if src == "mcp":
         return " **[AGENT-ORIGINATED via MCP]**"
+    if src == "legacy":
+        return " **[ORIGIN UNKNOWN: recorded before provenance tracking]**"
     if src == "import":
         return " *[from SARIF import]*"
     return ""
@@ -409,6 +412,18 @@ def agent_signoffs(mem: MemoryStore) -> dict:
     }
 
 
+def legacy_signoffs(mem: MemoryStore) -> int:
+    """Waivers and approvals recorded before provenance tracking existed (schema
+    v5 migration). An MCP agent could have written any of them, so a report must
+    not present them as human decisions."""
+    db = mem.db
+    return sum(db.execute(q).fetchone()[0] for q in (
+        "SELECT COUNT(*) FROM findings WHERE approval_source='legacy'",
+        "SELECT COUNT(*) FROM deviations WHERE source='legacy' AND revoked_at IS NULL",
+        "SELECT COUNT(*) FROM suppressions WHERE source='legacy'",
+        "SELECT COUNT(*) FROM recategorizations WHERE source='legacy'"))
+
+
 def _audit_lines(mem: MemoryStore, limit: int = 15) -> list[str]:
     rows = mem.audit_entries(limit)
     pending = mem.proposals()
@@ -419,6 +434,12 @@ def _audit_lines(mem: MemoryStore, limit: int = 15) -> list[str]:
         L += [f"> **WARNING: {n_agent} sign-off(s) were applied directly by an MCP agent** "
               "(MAISHAC_ALLOW_AGENT_APPROVALS was enabled), not by a person. They are "
               "marked below; review them before relying on this report.", ""]
+    n_legacy = legacy_signoffs(mem)
+    if n_legacy:
+        L += [f"> **NOTE: {n_legacy} sign-off(s) predate provenance tracking** (marked "
+              "`legacy`). Earlier versions let MCP tools write them directly, so it is "
+              "unknown whether a person made them. Review them, then re-record or "
+              "revoke the ones you do not stand behind.", ""]
     if pending:
         L += [f"{len(pending)} agent proposal(s) are awaiting a human decision "
               "(`maishac proposals list`).", ""]

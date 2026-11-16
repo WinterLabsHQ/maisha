@@ -227,11 +227,21 @@ class LoopEngine:
         self.close()
 
     # ------------------------------------------------------------------ scan
+    def _effective_gate(self, gate: bool) -> bool:
+        """An MCP-originated scan always runs gated: an agent that edits code and
+        rescans must not see its own findings go straight to ``resolved``. Only
+        the operator's MAISHAC_ALLOW_AGENT_APPROVALS=1 lifts this."""
+        if self.source == "mcp" and not agent_approvals_allowed():
+            return True
+        return gate
+
     def scan(self, paths: list[str], analyzers: list[str] | None = None,
              gate: bool = False, include_paths: list[str] | None = None,
              exclude: list[str] | None = None, default_excludes: bool = True,
              std: str | None = None, compiler_flags: list[str] | None = None,
-             compile_commands: str | None = None, kind: str = "scan") -> dict:
+             compile_commands: str | None = None, kind: str = "scan",
+             hold_for_human: bool = False) -> dict:
+        gate = self._effective_gate(gate)
         err = validate_analyzer_names(analyzers)
         if err:
             return {"error": err}
@@ -254,7 +264,7 @@ class LoopEngine:
         # Findings in files that have since been deleted are closed as stale.
         removed = {f for f in self.mem.tracked_files() if not (self.root / f).exists()}
         diff = self.mem.sync_scan(findings, scanned, gate=gate, analyzed=sr.analyzed,
-                                  removed_files=removed)
+                                  removed_files=removed, hold_for_human=hold_for_human)
         # Every scan states what it could NOT check. Without this a native-only
         # run returns a clean result indistinguishable from a full-toolchain
         # clean result, which silently overstates compliance.
@@ -317,6 +327,7 @@ class LoopEngine:
         from .. import report as report_mod
         src = self._resolve_input_path(path)
         data = json.loads(src.read_text("utf-8"))
+        gate = self._effective_gate(gate)
         findings = report_mod.parse_sarif(data, self.root)
         # Pre-record incoming suppressions so sync_scan buckets them as
         # suppressed instead of new/open (bring-your-own-triage).
@@ -667,8 +678,7 @@ class LoopEngine:
         return self.mem.proposals(status)
 
     # --------------------------------------------------------------- session
-    @staticmethod
-    def _validate_session_config(cfg: dict) -> str:
+    def _validate_session_config(self, cfg: dict) -> str:
         """Error message for an unusable session setting, or ''."""
         paths = cfg.get("paths")
         if not paths or not isinstance(paths, (list, tuple)) or not all(
@@ -681,6 +691,12 @@ class LoopEngine:
         if policy is not None and policy not in _VALID_POLICIES:
             return (f"Unknown verification_policy '{policy}'. "
                     f"Valid: {', '.join(_VALID_POLICIES)}.")
+        if (policy == "analyzer_only" and self.source == "mcp"
+                and not agent_approvals_allowed()):
+            return ("verification_policy 'analyzer_only' cannot be chosen through MCP: it "
+                    "would let the agent resolve findings by silencing the analyzer. Use "
+                    "test_gated or human_gated (the operator can set "
+                    f"{ALLOW_AGENT_APPROVALS_ENV}=1 to allow it).")
         if cfg.get("severity_floor") not in _SEV_ORDER:
             return (f"Unknown severity_floor '{cfg.get('severity_floor')}'. "
                     f"Valid: {', '.join(_SEV_ORDER)}.")
@@ -869,7 +885,12 @@ class LoopEngine:
             return {"error": f"Session {session_id} has already ended ({sess['status']}).",
                     "session_id": session_id, "state": sess["status"]}
         reason = (reason or "").strip() or "aborted on request"
-        self.mem.update_session(session_id, status="aborted", end_reason=reason)
+        if not self.mem.update_session(session_id, status="aborted", end_reason=reason,
+                                       expect_status=sess["status"]):
+            now = self._require(session_id)["status"]
+            return {"error": f"Session {session_id} changed while aborting (now {now}); "
+                             "nothing was changed. Check session_status and retry.",
+                    "session_id": session_id, "state": now}
         abandoned = self.mem.abandon_session_attempts(session_id)
         self.mem.audit("session_end", session_id, actor=by, source=self.source,
                        details={"state": "aborted", "iteration": sess["iteration"],
@@ -885,7 +906,7 @@ class LoopEngine:
         cfg = sess["config"]
         policy = self._policy(cfg)
         result = self.scan(cfg["paths"], cfg.get("analyzers"), gate=policy != "analyzer_only",
-                           kind="verify", **self._scan_kwargs(cfg))
+                           kind="verify", hold_for_human=True, **self._scan_kwargs(cfg))
         if "error" in result:
             return {"session_id": session_id, "state": sess["status"], "error": result["error"]}
         analyzer_errors = result["analyzer_errors"]
@@ -990,8 +1011,17 @@ class LoopEngine:
                 reason += " " + " ".join(notes)
 
         ending = state in TERMINAL_SESSION_STATES
-        self.mem.update_session(session_id, status=state, iteration=iteration, history=history,
-                                end_reason=reason if ending else None)
+        # Compare-and-set: the scan above can take minutes, and an abort (CLI) or a
+        # second verify may have landed meanwhile. Never overwrite it.
+        if not self.mem.update_session(session_id, status=state, iteration=iteration,
+                                       history=history, end_reason=reason if ending else None,
+                                       expect_status=sess["status"],
+                                       expect_iteration=sess["iteration"]):
+            now = self._require(session_id)["status"]
+            return {"session_id": session_id, "state": now,
+                    "error": f"Session {session_id} changed while verify was running "
+                             f"(now {now}); this verify result was not recorded. "
+                             "Call session_status and verify again if it is still live."}
         if ending:
             if state != "converged":
                 self.mem.abandon_session_attempts(session_id)

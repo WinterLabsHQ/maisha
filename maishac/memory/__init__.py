@@ -24,7 +24,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from ..model import Finding
+from ..model import Finding, compute_fingerprint
 
 
 class MandatoryRuleError(ValueError):
@@ -183,11 +183,14 @@ CREATE INDEX IF NOT EXISTS idx_attempts_fp ON fix_attempts(fingerprint);
 #   3: source/approver/expiry on suppressions, source + revocation on deviations,
 #      source on recategorizations, findings.approval_source, audit_log, proposals
 #   4: sessions.ended / sessions.end_reason (session lifecycle: abort, needs_human)
-SCHEMA_VERSION = 4
+#   5: backslash (Windows) paths rewritten to forward slashes with their fingerprints;
+#      rows that predate `source` columns are labelled 'legacy', not 'cli'
+SCHEMA_VERSION = 5
 
 # Session states that end a session for good. Everything else (active,
 # awaiting_verification, analysis_incomplete) can still be verified.
 TERMINAL_SESSION_STATES = ("converged", "budget_exhausted", "stalled", "needs_human", "aborted")
+_TERMINAL_SQL = ",".join(f"'{s}'" for s in TERMINAL_SESSION_STATES)
 
 
 class MemoryStore:
@@ -237,6 +240,7 @@ class MemoryStore:
     def _migrate(self) -> None:
         """Add verification-gate columns to findings tables created before they existed."""
         cols = {r["name"] for r in self.db.execute("PRAGMA table_info(findings)")}
+        legacy_approvals = "approval_source" not in cols
         for name, ddl in [("semantic_risk", "INTEGER NOT NULL DEFAULT 0"),
                           ("analyzer_cleared_at", "REAL"), ("verification_method", "TEXT"),
                           ("approved_by", "TEXT"), ("approved_at", "REAL"),
@@ -244,27 +248,81 @@ class MemoryStore:
                           ("approval_source", "TEXT")]:
             if name.strip('"') not in cols:
                 self.db.execute(f"ALTER TABLE findings ADD COLUMN {name} {ddl}")
+        if legacy_approvals:
+            # Approvals recorded before provenance existed may have been made by an
+            # MCP agent (the tools wrote them directly). Do not present them as human.
+            self.db.execute("UPDATE findings SET approval_source='legacy' "
+                            "WHERE approved_by IS NOT NULL AND approval_source IS NULL")
         for table, additions in (
-                ("suppressions", [("approver", "TEXT"), ("source", "TEXT NOT NULL DEFAULT 'cli'"),
+                # Rows that predate the `source` column have unknown provenance:
+                # earlier versions let MCP tools write them directly, so they are
+                # labelled 'legacy', never 'cli'.
+                ("suppressions", [("approver", "TEXT"), ("source", "TEXT NOT NULL DEFAULT 'legacy'"),
                                   ("expires", "REAL")]),
-                ("deviations", [("source", "TEXT NOT NULL DEFAULT 'cli'"),
+                ("deviations", [("source", "TEXT NOT NULL DEFAULT 'legacy'"),
                                 ("revoked_at", "REAL"), ("revoked_by", "TEXT")]),
-                ("recategorizations", [("source", "TEXT NOT NULL DEFAULT 'cli'")]),
+                ("recategorizations", [("source", "TEXT NOT NULL DEFAULT 'legacy'")]),
                 ("sessions", [("ended", "REAL"), ("end_reason", "TEXT")])):
             have = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
             for name, ddl in additions:
                 if name not in have:
                     self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
         # `scans`, `audit_log` and `proposals` are created by _SCHEMA (CREATE TABLE
-        # IF NOT EXISTS), which also runs against old databases. Just stamp the version.
+        # IF NOT EXISTS), which also runs against old databases.
+        if self.db.execute("PRAGMA user_version").fetchone()[0] < 5:
+            self._normalize_stored_paths()
         if self.db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
             self.db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def _normalize_stored_paths(self) -> None:
+        """One-time (schema v5): rewrite backslash paths recorded on Windows.
+
+        Paths are now always stored with forward slashes, and the fingerprint
+        covers the path, so a database built on Windows would otherwise never
+        match its own files again: old rows stay open forever beside new
+        duplicates. Each affected row gets its forward-slash path and the
+        fingerprint Maisha would compute now (the occurrence index is recovered by
+        matching the stored fingerprint). Fingerprints that Maisha did not compute
+        (imported from an external tool) keep their value and only the path
+        changes. Rows other tables hold by fingerprint follow the rename. If the
+        new fingerprint already exists (a rescan ran first), the old row is
+        dropped in favour of the live one. Each rewrite is audit-logged."""
+        rows = self.db.execute(
+            "SELECT * FROM findings WHERE file LIKE '%\\%'").fetchall()
+        for r in rows:
+            old_fp, old_file = r["fingerprint"], r["file"]
+            new_file = old_file.replace("\\", "/")
+            new_fp = old_fp
+            for n in range(0, 64):
+                if compute_fingerprint(r["rule_id"], old_file, r["line_content"] or "",
+                                       r["context_symbol"] or "", n) == old_fp:
+                    new_fp = compute_fingerprint(r["rule_id"], new_file,
+                                                 r["line_content"] or "",
+                                                 r["context_symbol"] or "", n)
+                    break
+            if new_fp != old_fp and self.db.execute(
+                    "SELECT 1 FROM findings WHERE fingerprint=?", (new_fp,)).fetchone():
+                self.db.execute("DELETE FROM findings WHERE fingerprint=?", (old_fp,))
+                action = "path_migration_dropped_duplicate"
+            else:
+                self.db.execute("UPDATE findings SET file=?, fingerprint=? WHERE fingerprint=?",
+                                (new_file, new_fp, old_fp))
+                if new_fp != old_fp:
+                    for table in ("fix_attempts", "suppressions"):
+                        self.db.execute(
+                            f"UPDATE OR IGNORE {table} SET fingerprint=? WHERE fingerprint=?",
+                            (new_fp, old_fp))
+                action = "path_migration"
+            self.audit(action, new_fp, source="engine", commit=False,
+                       details={"from_file": old_file, "to_file": new_file,
+                                "from_fingerprint": old_fp, "to_fingerprint": new_fp})
 
     # ------------------------------------------------------------ scan sync
     def sync_scan(self, findings: list[Finding], scanned_files: list[str],
                   gate: bool = False, producers: set[str] | None = None,
                   analyzed: dict[str, set[str]] | None = None,
-                  removed_files: set[str] | None = None) -> dict:
+                  removed_files: set[str] | None = None,
+                  hold_for_human: bool = False) -> dict:
         """Reconcile a fresh scan against memory.
 
         Returns a diff: {new, persisting, resolved, pending, regressed, suppressed,
@@ -292,8 +350,19 @@ class MemoryStore:
 
         ``removed_files`` are files on record that no longer exist on disk. The
         open findings in them are closed as stale (resolved, verification method
-        ``file_removed``) and listed under ``stale`` in the diff: the code is
-        gone, so no analyzer judgement or sign-off is needed.
+        ``file_removed``) and listed under ``stale`` in the diff. A path that
+        vanished may have been moved or renamed rather than fixed, so a finding
+        that needs human sign-off (see ``requires_human``), or any finding under
+        ``gate``, goes to ``pending_verification`` instead.
+
+        ``hold_for_human`` keeps the ungated path from resolving a finding that
+        needs human sign-off (``requires_human``: high severity or semantic risk):
+        those go to ``pending_verification`` even with ``gate=False``. Session
+        verification sets it, so the ``analyzer_only`` policy cannot bypass the
+        rule that such findings always need a person.
+
+        Engine callers that act for an MCP agent always pass ``gate=True`` (see
+        LoopEngine._effective_gate); only a human-run CLI scan may use gate=False.
 
         Lifecycle: a finding that reappears after being resolved *or* after
         being pending_verification is a regression (counted, so the oscillation
@@ -381,6 +450,17 @@ class MemoryStore:
                 continue
             if (removed_files and prev["file"] in removed_files
                     and prev["status"] in ("open", "regressed", "pending_verification")):
+                if prev["status"] == "pending_verification":
+                    continue   # already awaiting its verdict; a missing file adds nothing
+                if gate or requires_human(prev):
+                    # A file that vanished from its path may have been moved or
+                    # renamed, not fixed: closing it here would let a blocker
+                    # disappear without sign-off. It waits for verification.
+                    self.db.execute(
+                        "UPDATE findings SET status='pending_verification', "
+                        "analyzer_cleared_at=? WHERE fingerprint=?", (now, fp))
+                    diff["pending"].append(fp)
+                    continue
                 self.db.execute(
                     "UPDATE findings SET status='resolved', resolved_at=?, "
                     "verification_method='file_removed' WHERE fingerprint=?", (now, fp))
@@ -399,7 +479,7 @@ class MemoryStore:
                     a in producers for a in (prev["analyzer"] or "").split("+")):
                 continue  # this finding's analyzer didn't run — can't judge it cleared
             if prev["status"] in ("open", "regressed") and prev["file"] in scanned:
-                if gate:
+                if gate or (hold_for_human and requires_human(prev)):
                     self.db.execute(
                         "UPDATE findings SET status='pending_verification', "
                         "analyzer_cleared_at=? WHERE fingerprint=?", (now, fp))
@@ -628,6 +708,19 @@ class MemoryStore:
     def is_mandatory(self, rule_id: str) -> bool:
         return self.effective_category(rule_id) == "mandatory"
 
+    def _require_resolvable(self, rule_id: str, what: str, strict: bool = True) -> None:
+        """Refuse a rule reference the registry cannot pin to one guideline. An
+        ambiguous id (a bare "4.1" that is both a Rule and a Directive) could name a
+        Mandatory guideline, so the Mandatory check below would be guessing; failing
+        open there would let a waiver through. ``strict=False`` lets an id the
+        registry does not know at all pass (imported findings carry foreign tool
+        ids), but still refuses an ambiguous one."""
+        from ..rules import REGISTRY
+        if REGISTRY.get(rule_id) or REGISTRY.resolve(rule_id):
+            return
+        if strict or REGISTRY.candidates(rule_id):
+            raise ValueError(f"Cannot record a {what}: " + REGISTRY.resolve_error(rule_id))
+
     def _require_not_mandatory(self, rule_id: str, what: str) -> None:
         if self.is_mandatory(rule_id):
             from ..rules import REGISTRY
@@ -651,6 +744,7 @@ class MemoryStore:
         Raises ValueError for a negative or already-past expiry.
         """
         from ..rules import REGISTRY
+        self._require_resolvable(rule_id, "deviation")
         self._require_not_mandatory(rule_id, "deviation")
         meta = REGISTRY.get(rule_id) or REGISTRY.resolve(rule_id)
         if meta:
@@ -745,6 +839,7 @@ class MemoryStore:
         """Record a Guideline Re-categorization Plan entry. Legality (which
         moves MISRA permits) is enforced by the caller (engine.recategorize).
         An entry it replaces is kept in the audit log."""
+        self._require_resolvable(rule_id, "re-categorization")
         prev = self.db.execute("SELECT * FROM recategorizations WHERE rule_id=?",
                                (rule_id,)).fetchone()
         self.db.execute(
@@ -790,6 +885,7 @@ class MemoryStore:
         f = self.get_finding(fingerprint)
         if not f and rule_id is None:
             raise ValueError(f"No finding with fingerprint '{fingerprint}'.")
+        self._require_resolvable(f["rule_id"] if f else rule_id, "suppression", strict=False)
         self._require_not_mandatory(f["rule_id"] if f else rule_id, "suppression")
         now = time.time()
         if expires_at is not None and expires_at <= now:
@@ -922,8 +1018,9 @@ class MemoryStore:
         self.db.commit()
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            r = self.db.execute("SELECT id FROM sessions WHERE status='active'"
-                                " ORDER BY started DESC LIMIT 1").fetchone()
+            r = self.db.execute(
+                f"SELECT id FROM sessions WHERE status NOT IN ({_TERMINAL_SQL})"
+                " ORDER BY started DESC LIMIT 1").fetchone()
             if r and not force:
                 self.db.execute("ROLLBACK")
                 return None, self.get_session(r["id"])
@@ -946,7 +1043,13 @@ class MemoryStore:
     def update_session(self, sid: str, *, status: str | None = None,
                        iteration: int | None = None,
                        history: list | None = None,
-                       end_reason: str | None = None) -> None:
+                       end_reason: str | None = None,
+                       expect_status: str | None = None,
+                       expect_iteration: int | None = None) -> bool:
+        """Write session fields. With ``expect_status`` / ``expect_iteration`` the
+        write is a compare-and-set: it applies only if the row still has that
+        status/iteration, so a slow verify cannot overwrite a concurrent abort or
+        another verify. Returns False when nothing was written."""
         sets, args = ["updated=?"], [time.time()]
         if status is not None:
             sets.append("status=?"); args.append(status)
@@ -959,13 +1062,21 @@ class MemoryStore:
         if history is not None:
             sets.append("history=?"); args.append(json.dumps(history))
         args.append(sid)
-        self.db.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id=?", args)
+        where = "id=?"
+        if expect_status is not None:
+            where += " AND status=?"; args.append(expect_status)
+        if expect_iteration is not None:
+            where += " AND iteration=?"; args.append(expect_iteration)
+        cur = self.db.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE {where}", args)
         self.db.commit()
+        return cur.rowcount > 0
 
     def latest_active_session(self) -> Optional[dict]:
+        """The newest session that has not ended (active, awaiting_verification
+        or analysis_incomplete)."""
         r = self.db.execute(
-            "SELECT id FROM sessions WHERE status='active' ORDER BY started DESC LIMIT 1"
-        ).fetchone()
+            f"SELECT id FROM sessions WHERE status NOT IN ({_TERMINAL_SQL})"
+            " ORDER BY started DESC LIMIT 1").fetchone()
         return self.get_session(r["id"]) if r else None
 
     # ------------------------------------------------------------------ stats

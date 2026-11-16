@@ -444,6 +444,10 @@ So a fix does **not** go straight to `resolved`. It enters
 | `human_gated` | a human calls `approve_finding` |
 
 Default: `test_gated` if a test command is configured, else `human_gated`.
+Over MCP, `analyzer_only` is refused and every scan is gated, so an agent cannot
+resolve findings by editing code and rescanning (`MAISHAC_ALLOW_AGENT_APPROVALS=1`
+lifts this; unsafe). A file that vanishes from its path (moved or renamed) does not
+resolve its high-severity findings either: they wait for a person.
 Regardless of policy, **semantic-risk findings** (casts, comparisons, sign
 conversions, control-flow changes) and **high-severity findings** always require
 human approval — a green test suite that never exercises the sentinel case cannot

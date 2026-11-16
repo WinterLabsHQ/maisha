@@ -342,9 +342,10 @@ def compliance_begin_session(paths: list[str], max_iterations: int = 10,
         severity_floor: Ignore findings below this severity
             (blocker|critical|major|minor|info; default minor).
         verification_policy: How a fix is confirmed resolved:
-            "analyzer_only" (the analyzer stopped flagging it — NOT recommended
-            for compliance; it can't see behavior changes at sentinel/boundary
-            values), "test_gated" (a passing human-configured test command confirms fixes), or
+            "analyzer_only" (refused over MCP unless the operator sets
+            MAISHAC_ALLOW_AGENT_APPROVALS=1; the analyzer stopping is not
+            evidence a fix is right, it can't see behavior changes at
+            sentinel/boundary values), "test_gated" (a passing human-configured test command confirms fixes), or
             "human_gated" (a human must call compliance_approve_finding).
             Default: test_gated if the HUMAN configured a test command (CLI
             --test-command, MAISHAC_TEST_COMMAND or .maishac/config.json), else

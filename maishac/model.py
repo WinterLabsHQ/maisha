@@ -97,7 +97,39 @@ class Finding:
         return Finding(**{k: v for k, v in d.items() if k in known})
 
 
-def assign_occurrences(findings: list["Finding"]) -> list["Finding"]:
+def _base_fingerprint(f: "Finding") -> str:
+    return compute_fingerprint(f.rule_id, f.file, f.line_content, f.context_symbol)
+
+
+def occurrence_alignment(runs: list[list["Finding"]]) -> dict[str, list[int]]:
+    """Line lists that let several analyzers number identical violations alike.
+
+    ``assign_occurrences`` numbers repeats within one analyzer's run. If tool A
+    reports both of two identical lines and tool B only the second, B's lone
+    finding would be occurrence 0 and merge into A's finding for the FIRST line.
+    For each group of identical violations this returns the sorted union of the
+    lines all analyzers reported, so occurrence = position in that union. It is
+    only used when the analyzers agree on how many distinct violations there are
+    (the union is as long as the largest single run's list); if they disagree on
+    where one violation is (off-by-a-line reports) alignment would invent extra
+    occurrences, so that group keeps per-analyzer numbering.
+    """
+    union: dict[str, set[int]] = {}
+    biggest: dict[str, int] = {}
+    for run in runs:
+        per: dict[str, set[int]] = {}
+        for f in run:
+            if f.fingerprint == _base_fingerprint(f):
+                per.setdefault(f.fingerprint, set()).add(f.line)
+        for base, lines in per.items():
+            union.setdefault(base, set()).update(lines)
+            biggest[base] = max(biggest.get(base, 0), len(lines))
+    return {base: sorted(lines) for base, lines in union.items()
+            if len(lines) == biggest[base]}
+
+
+def assign_occurrences(findings: list["Finding"],
+                       aligned: dict[str, list[int]] | None = None) -> list["Finding"]:
     """Give identical violations their own identity.
 
     Two findings of the same rule on identical (whitespace-normalized) lines in
@@ -107,6 +139,10 @@ def assign_occurrences(findings: list["Finding"]) -> list["Finding"]:
     keeps the legacy fingerprint. Repeats on the very same line are one
     finding, as before. Only fingerprints Maisha computed itself are touched;
     ones supplied by an external tool are kept verbatim.
+
+    ``aligned`` (from :func:`occurrence_alignment`) numbers a finding by the
+    position of its line in the lines every analyzer reported, instead of by
+    the order within this run alone.
 
     Returns the findings with exact repeats removed, in their original order.
     """
@@ -126,6 +162,8 @@ def assign_occurrences(findings: list["Finding"]) -> list["Finding"]:
                 continue
             places.append(place)
             n = len(places) - 1
+            if aligned and place in aligned.get(base, ()):
+                n = aligned[base].index(place)
             if n:
                 f.fingerprint = compute_fingerprint(f.rule_id, f.file, f.line_content,
                                                     f.context_symbol, n)

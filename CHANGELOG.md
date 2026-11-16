@@ -35,9 +35,30 @@ Read these before upgrading; each is also listed under Added/Changed/Fixed/Secur
   `pip install 'maishac[mcp]'` (pinned `mcp>=1.2.0,<2`) for `maishac serve`.
 - **MCP path confinement:** paths outside the project root are rejected unless
   `MAISHAC_ALLOW_OUTSIDE_PROJECT=1`.
-- **Memory schema is now v4** and migrates in place on first open. Downgrading afterwards is not supported.
+- **Memory schema is now v5** and migrates in place on first open. Downgrading afterwards is not supported.
+- **MCP scans are always gated.** An MCP-originated `compliance_scan`, `compliance_import_sarif` or
+  session `verify` sends findings the analyzer no longer reports to `pending_verification`, never
+  straight to `resolved`. `compliance_begin_session(verification_policy="analyzer_only")` is rejected
+  over MCP. `MAISHAC_ALLOW_AGENT_APPROVALS=1` lifts both (unsafe). The CLI is unchanged, except that
+  a session with the `analyzer_only` policy now holds blocker/critical and semantic-risk findings
+  for human approval.
+- **Waivers recorded before provenance tracking show as `legacy`**, not `cli`. Suppressions,
+  deviations, re-categorizations and approvals from a pre-v3 database could have been written by an
+  MCP agent, so reports flag them "origin unknown". Review them, and re-record or revoke the ones
+  you do not stand behind.
+- **Windows databases are rewritten once.** Rows stored with backslash paths get forward-slash paths
+  and the fingerprints Maisha now computes (suppressions and fix attempts follow; each rewrite is in
+  the audit log). Fingerprints imported from other tools keep their value and only the path changes.
+- **`MemoryStore.add_deviation` / `add_recategorization` raise `ValueError`** for a rule id the
+  registry cannot resolve, and `suppress` for an ambiguous one, instead of treating it as non-Mandatory.
 
 ### Security
+- **An MCP agent can no longer resolve findings by rescanning.** `LoopEngine.scan` and
+  `import_sarif` force the verification gate when the engine was created for MCP, so editing code and
+  calling `compliance_scan` no longer produces `resolved`/`analyzer` rows for blocker or
+  semantic-risk findings. A finding in a file that disappeared from its path (moved, renamed,
+  moved into an excluded directory) goes to `pending_verification` when it is high-severity,
+  semantic-risk or the scan is gated, instead of `resolved`/`file_removed`.
 - **An MCP agent can no longer approve its own work.** `compliance_approve_finding`,
   `compliance_add_deviation`, `compliance_recategorize` and
   `compliance_suppress_finding` now create *proposals* (`pending_human`) that a
@@ -95,7 +116,7 @@ Read these before upgrading; each is also listed under Added/Changed/Fixed/Secur
 - Re-importing a newer SARIF file from the same tool resolves the imported findings
   that are gone from it (to `pending_verification` by default, so a person still
   confirms with `approve`), limited to that tool and the files its run covers.
-- Findings in files that were deleted are closed as stale (`resolved`, verification
+- Findings in files that were deleted are closed as stale (`resolved`, unless high-severity or semantic-risk: those wait in `pending_verification`; verification
   method `file_removed`; `stale` in the scan diff). Schema v4 adds
   `sessions.ended` / `sessions.end_reason` (migrates in place).
 - Append-only `audit_log` (every approval, suppression, deviation,
@@ -107,6 +128,15 @@ Read these before upgrading; each is also listed under Added/Changed/Fixed/Secur
   recategorizations, `approval_source` on findings, `proposals` and `audit_log` tables.
 
 ### Fixed
+- `verify` and `abort` write the session status as a compare-and-set: a slow `verify` can no longer
+  overwrite a session aborted (or verified) meanwhile; it returns an error and records nothing.
+- `begin_session` is blocked by a session in `awaiting_verification` or `analysis_incomplete`, not only
+  `active` (`force` still overrides).
+- Identical violating lines are numbered by line across analyzers before merging, so a tool that
+  reports only the second of two identical lines no longer merges into the first line's finding.
+  Known limit: identity of repeats is positional, so fixing the first of two identical lines makes
+  the survivor take the first line's fingerprint (and any suppression/approval attached to it).
+  Re-check such waivers after editing one of several identical lines.
 - **A failing analyzer no longer reads as a fix** (see Added: honest analysis outcomes), and plumbing
   bugs behind it: a shared `_line_of` source cache, cppcheck `misra-c2012-dir-N` ids now map to
   `MISRA-C:2012 Dir N`, cppcheck gets `--file-list` instead of a huge argv, and clang-tidy runs once per file with

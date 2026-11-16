@@ -88,7 +88,7 @@ def test_ended_session_abandons_its_undecided_attempts(tmp_path):
 
 
 # --------------------------------------------------------------- 14: stale
-def test_finding_in_a_deleted_file_is_closed_as_stale(tmp_path):
+def test_high_severity_finding_in_a_deleted_file_waits_for_verification(tmp_path):
     proj = _proj(tmp_path, ONE_MALLOC, "gone.c")
     (proj / "src" / "keep.c").write_text(ONE_MALLOC)
     eng = LoopEngine(proj)
@@ -96,11 +96,23 @@ def test_finding_in_a_deleted_file_is_closed_as_stale(tmp_path):
     fp = next(f["fingerprint"] for f in eng.mem.open_findings() if f["file"] == "src/gone.c")
     (proj / "src" / "gone.c").unlink()
     out = eng.scan(["src"], ["native"])
-    assert out["diff"]["stale"] >= 1
+    assert out["diff"]["pending"] >= 1
     row = eng.mem.get_finding(fp)
-    assert row["status"] == "resolved" and row["verification_method"] == "file_removed"
+    # a critical finding may not close on a missing path alone (it may have moved)
+    assert row["status"] == "pending_verification"
     assert all(f["file"] != "src/gone.c" for f in eng.mem.open_findings())
     assert any(f["file"] == "src/keep.c" for f in eng.mem.open_findings())
+
+
+def test_low_severity_finding_in_a_deleted_file_is_closed_as_stale(tmp_path):
+    mem = MemoryStore(tmp_path)
+    f = _fnd()
+    f.severity = "minor"
+    mem.sync_scan([f], ["a.c"])
+    d = mem.sync_scan([], ["b.c"], removed_files={"a.c"})
+    row = mem.get_finding(f.fingerprint)
+    assert d["stale"] == [f.fingerprint]
+    assert row["status"] == "resolved" and row["verification_method"] == "file_removed"
 
 
 # ------------------------------------------------------- 15: imported findings

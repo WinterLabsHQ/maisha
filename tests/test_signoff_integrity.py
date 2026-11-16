@@ -389,8 +389,8 @@ def test_v2_database_migrates_in_place_to_v3(tmp_path):
     assert {"approver", "source", "expires"} <= cols("suppressions")
     assert {"source", "revoked_at", "revoked_by"} <= cols("deviations")
     assert "source" in cols("recategorizations") and "approval_source" in cols("findings")
-    # old rows survive and read as human/CLI-originated
-    assert mem.suppressions()[0]["reason"] == "old reason" and mem.suppressions()[0]["source"] == "cli"
+    # old rows survive; their provenance is unknown, so they are NOT labelled cli
+    assert mem.suppressions()[0]["reason"] == "old reason" and mem.suppressions()[0]["source"] == "legacy"
     assert mem.deviations()[0]["justification"] == "kept"
     assert mem.is_suppressed("fp1")
     assert mem.is_mandatory("MISRA-C:2012 Rule 15.5")

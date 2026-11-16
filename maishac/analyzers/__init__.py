@@ -10,7 +10,7 @@ from .native import NativeAnalyzer
 from .cppcheck import CppcheckAnalyzer
 from .clang_tidy import ClangTidyAnalyzer
 from .compiler import CompilerAnalyzer
-from ..model import Finding, assign_occurrences
+from ..model import Finding, assign_occurrences, occurrence_alignment
 
 ALL_ANALYZERS: list[type[Analyzer]] = [NativeAnalyzer, CppcheckAnalyzer,
                                        ClangTidyAnalyzer, CompilerAnalyzer]
@@ -87,10 +87,14 @@ def run_scan_detailed(paths: list[str], root: Path,
         except Exception as e:  # noqa: BLE001 — an analyzer bug must not look like a clean run
             res = AnalysisResult.failure(an.name, files, root,
                                          f"{type(e).__name__}: {e}")
-        # identical violating lines in one function get their own identity;
-        # per analyzer, so two tools reporting the same line still merge below
-        res.findings = assign_occurrences(res.findings)
         results.append(res)
+    # Identical violating lines in one function get their own identity. The
+    # numbering is aligned across analyzers (by line) before merging, so a tool
+    # that reports only the second of two identical lines does not merge into
+    # the first line's finding.
+    aligned = occurrence_alignment([r.findings for r in results])
+    for an, res in zip(active, results):
+        res.findings = assign_occurrences(res.findings, aligned)
         for fnd in res.findings:
             key = fnd.fingerprint
             if key in merged:

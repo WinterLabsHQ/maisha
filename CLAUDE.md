@@ -99,7 +99,7 @@ maishac/memory/        SQLite store at <project>/.maishac/memory.db (WAL mode,
                         `audit_log`, and a `source` column (cli|mcp) on
                         suppressions/deviations/recategorizations. Schema changes
                         go through `MemoryStore._migrate` (PRAGMA user_version,
-                        SCHEMA_VERSION = 4); add a migration test built from the
+                        SCHEMA_VERSION = 5); add a migration test built from the
                         OLD `_SCHEMA`.
 maishac/engine/        LoopEngine: the deterministic half of the fix loop —
                         session lifecycle, severity-floored/file-grouped
