@@ -19,6 +19,13 @@ Read these before upgrading; each is also listed under Added/Changed/Fixed/Secur
 - **`test_command` removed from the MCP `compliance_begin_session`.** Configure it with
   `--test-command`, `MAISHAC_TEST_COMMAND` or `.maishac/config.json`; it runs without a shell and the
   default timeout is 600 s (was 1800 s).
+- **`maishac proposals accept` asks for confirmation.** It needs an interactive terminal (type the
+  proposal id). Scripts without a TTY must pass `--yes` with `MAISHAC_HUMAN=1` and a
+  `MAISHAC_CONFIRM_TOKEN` matching the token registered by `maishac proposals set-token`.
+  Accepts record OS user and TTY state in the audit log. Changes to the test command are
+  audit-logged, shown in `maishac doctor` and flagged in reports when they differ from the
+  command a session started with. This raises the cost for an agent with a shell; it is not a
+  boundary (see SECURITY.md).
 - **CLI errors exit 1** with `error: ...` on stderr instead of a traceback. A scan that finds no
   files is an error, not `converged`.
 - **Scan exit codes:** `scan` still exits 0 unless `--fail-on` (or `gate`) is given. With it, exit 1

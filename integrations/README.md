@@ -17,7 +17,8 @@ env `MAISHAC_PROJECT` pointing at the project root to scan.
 
 **Sign-offs need a human.** Through MCP the approve / deviate / suppress /
 recategorize tools only create proposals; a person finalizes them with
-`maishac proposals list` and `maishac proposals accept <id> --by <name>`. The test
+`maishac proposals list` and `maishac proposals accept <id> --by <name>` (interactive
+terminal confirmation; see SECURITY.md for the non-interactive token mode). The test
 command is not settable by the agent either: use `--test-command`,
 `MAISHAC_TEST_COMMAND` or `.maishac/config.json`. To let the agent decide for
 itself (unsafe, flagged in every report) add `"MAISHAC_ALLOW_AGENT_APPROVALS": "1"`

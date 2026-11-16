@@ -389,7 +389,7 @@ The default is `test_gated` if a test command is configured, else `human_gated`.
 
 | Rule | Detail |
 |---|---|
-| MCP sign-offs are proposals | `compliance_approve_finding`, `compliance_add_deviation`, `compliance_recategorize` and `compliance_suppress_finding` create a proposal (`pending_human`). Nothing changes until a person runs `maishac proposals accept <id> --by <who>` (or `reject <id> --by <who> -r "why"`). The accepting person is recorded as approver. |
+| MCP sign-offs are proposals | `compliance_approve_finding`, `compliance_add_deviation`, `compliance_recategorize` and `compliance_suppress_finding` create a proposal (`pending_human`). Nothing changes until a person runs `maishac proposals accept <id> --by <who>` in a terminal and types the proposal id to confirm (or `reject <id> --by <who> -r "why"`). The accepting person is recorded as approver, with OS user and TTY state in the audit log. Scripts without a TTY need `--yes`, `MAISHAC_HUMAN=1` and `MAISHAC_CONFIRM_TOKEN` matching the token a person registered with `maishac proposals set-token`. |
 | Over MCP, scans are gated | `analyzer_only` is refused, so an agent cannot resolve findings by editing code and rescanning. |
 | Opt-out exists, and is unsafe | `MAISHAC_ALLOW_AGENT_APPROVALS=1` in the server's environment makes those tools act directly. The agent then grades its own work. Entries are stored with `source=mcp`, marked `[AGENT-ORIGINATED]` and flagged in reports. |
 | Mandatory rules are protected | MISRA Mandatory guidelines (judged after GRP re-categorization) can never be suppressed or deviated, in any mode. |

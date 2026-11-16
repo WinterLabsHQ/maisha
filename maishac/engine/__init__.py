@@ -39,6 +39,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from .. import trust
 from ..analyzers import ALL_ANALYZERS, run_scan_detailed
 from ..analyzers.base import validate_compiler_flags
 from ..model import relpath
@@ -642,7 +643,9 @@ class LoopEngine:
                    f"{p.get('justification', '')[:80]}"
         return f"recategorize {p.get('rule')} to {p.get('to_category')}: {p.get('rationale', '')[:80]}"
 
-    def accept_proposal(self, pid: str, by: str) -> dict:
+    def accept_proposal(self, pid: str, by: str, confirmation: dict | None = None) -> dict:
+        """``confirmation`` is the actor context from maishac.trust.confirm_accept
+        (OS user, tty/non-tty, method, time); it is stored in the audit log."""
         by = (by or "").strip()
         if not by:
             return {"error": "--by is required: record the human who accepts this."}
@@ -659,7 +662,8 @@ class LoopEngine:
         if "error" in result:
             return {"error": f"Proposal '{pid}' can no longer be applied: {result['error']}",
                     "proposal_id": pid, "status": "pending_human"}
-        self.mem.decide_proposal(pid, "accepted", by, result=result)
+        self.mem.decide_proposal(pid, "accepted", by, result=result,
+                                 actor_context=confirmation)
         return {"proposal_id": pid, "status": "accepted", "result": result}
 
     def reject_proposal(self, pid: str, by: str, note: str = "") -> dict:
@@ -743,6 +747,20 @@ class LoopEngine:
                 out.append(f)
         return {"in_scope": in_scope, "imported": imported, "out_of_scope": out}
 
+    def _observe_test_command(self) -> dict:
+        """Audit-log a change of the project-level test command (env or
+        .maishac/config.json) the first time Maisha sees it."""
+        state = trust.test_command_state(self.root)
+        last = self.mem.last_audit("test_command_change")
+        old = (last or {}).get("details", {}).get("new_sha256", "")
+        if state["sha256"] != old and (last is not None or state["sha256"]):
+            self.mem.audit("test_command_change", "test_command", source=self.source,
+                           actor=trust.os_user(),
+                           details={"old_sha256": old, "new_sha256": state["sha256"],
+                                    "command": state["command"], "origin": state["source"],
+                                    "config_mtime": state["config_mtime"]})
+        return state
+
     def _terminal_error(self, sess: dict, action: str) -> dict | None:
         if sess["status"] in TERMINAL_SESSION_STATES:
             return {"error": f"Session {sess['id']} has ended ({sess['status']}); {action} is "
@@ -767,6 +785,13 @@ class LoopEngine:
         if not cfg.get("test_command"):
             cfg["test_command"] = (os.environ.get("MAISHAC_TEST_COMMAND", "").strip()
                                    or project_cfg.get("test_command") or None)
+        # Record which command this session started with (hash, not value) so a
+        # later edit of config.json shows up as a difference in reports.
+        tc_state = self._observe_test_command()
+        cfg["test_command_sha256"] = trust.sha(cfg.get("test_command"))
+        cfg["test_command_source"] = (None if not cfg.get("test_command") else
+                                      "cli" if config and config.get("test_command")
+                                      else tc_state["source"])
         if not cfg.get("test_timeout"):
             env_t = os.environ.get("MAISHAC_TEST_TIMEOUT", "").strip()
             try:
@@ -904,6 +929,7 @@ class LoopEngine:
         if err:
             return err
         cfg = sess["config"]
+        self._observe_test_command()
         policy = self._policy(cfg)
         want_gate = policy != "analyzer_only"
         forced_gate = self._effective_gate(want_gate) and not want_gate

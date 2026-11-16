@@ -766,6 +766,10 @@ class MemoryStore:
         if commit:
             self.db.commit()
 
+    def last_audit(self, action: str) -> Optional[dict]:
+        rows = self.audit_entries(1, action)
+        return rows[0] if rows else None
+
     def audit_entries(self, limit: int = 100, action: str | None = None) -> list[dict]:
         q, args = "SELECT * FROM audit_log", []
         if action:
@@ -1055,13 +1059,16 @@ class MemoryStore:
         return [self._proposal_row(r) for r in self.db.execute(q + " ORDER BY ts", args)]
 
     def decide_proposal(self, pid: str, status: str, decided_by: str,
-                        note: str = "", result: dict | None = None) -> None:
+                        note: str = "", result: dict | None = None,
+                        actor_context: dict | None = None) -> None:
         self.db.execute(
             "UPDATE proposals SET status=?, decided_by=?, decided_at=?, decision_note=?, result=?"
             " WHERE id=?", (status, decided_by, time.time(), note,
                             json.dumps(result, default=str) if result is not None else None, pid))
         self.audit(f"proposal_{status}", pid, actor=decided_by, source="cli",
-                   details={"note": note, "result": result}, commit=False)
+                   details={"note": note, "result": result,
+                            **({"actor_context": actor_context} if actor_context else {})},
+                   commit=False)
         self.db.commit()
 
     # ----------------------------------------------------------------- notes
@@ -1094,6 +1101,10 @@ class MemoryStore:
                         (sid, json.dumps(config), "[]", now, now))
         self.db.commit()
         return sid
+
+    def latest_session(self) -> Optional[dict]:
+        r = self.db.execute("SELECT id FROM sessions ORDER BY started DESC LIMIT 1").fetchone()
+        return self.get_session(r["id"]) if r else None
 
     def get_session(self, sid: str) -> Optional[dict]:
         r = self.db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
