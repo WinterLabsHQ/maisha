@@ -131,7 +131,6 @@ _UNDEF_RE = re.compile(r"^\s*#\s*undef\b")
 _TRIGRAPH_RE = re.compile(r"\?\?[=/'()!<>\-]")
 _VLA_RE = re.compile(r"\b(?:int|char|float|double|long|short|uint\d+_t|int\d+_t|size_t)\s+\w+\s*\[\s*([a-zA-Z_]\w*)\s*\]")
 _MACRO_CONST_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-_FLOAT_EQ_RE = re.compile(r"\b(float|double)\b")
 _BASIC_TYPE_DECL_RE = re.compile(r"^\s*(?:static\s+|const\s+|volatile\s+|extern\s+)*(?:unsigned\s+|signed\s+)?(int|short|long)\b(?!\s*\()")
 _COMMENTED_CODE_RE = re.compile(r"(;|\{|\}|\breturn\b|=)")
 _PREPROC_RE = re.compile(r"^\s*#")
@@ -203,16 +202,6 @@ _DEFAULT_LABEL_RE = re.compile(r"\bdefault\s*:")
 # `case X:` -- the value may contain colons (a scope operator never does in C,
 # but a character constant like ':' does), so match the keyword, not the colon.
 _CASE_LABEL_RE = re.compile(r"\bcase\b[^;]*:")
-_GOTO_LABEL_RE = re.compile(r"\bgoto\s+(\w+)\s*;")
-# A label definition: an identifier alone before a colon at the start of a
-# statement. Excludes `case`/`default` (handled above) and anything that looks
-# like a ternary or a bit-field width.
-_LABEL_DEF_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*:(?!:)(?!\s*[0-9])\s*$")
-# Strips a leading `case X:` / `default:` so a one-line clause is judged on its
-# statement rather than its label.
-_LABEL_PREFIX_RE = re.compile(r"^\s*(?:case\b[^;]*?|default\s*):")
-# What may legitimately end a switch clause (Rule 16.3).
-_CLAUSE_TERMINATOR_RE = re.compile(r"\b(break|return|goto|continue)\b")
 
 
 def _logical_preproc(lines: list[str]) -> list[tuple[int, str]]:
@@ -464,29 +453,7 @@ class NativeAnalyzer(Analyzer):
         )
 
     @staticmethod
-    def _resolve_gotos(fn: dict, add) -> None:
-        """Rule 15.2 (a goto must jump forward) is deliberately NOT implemented.
-
-        Labels are function-scoped in C, so the rule is only decidable with
-        reliable function boundaries -- and _FUNC_DEF_RE needs the whole
-        signature on one line, which mbedtls and lwip routinely split across
-        three. Without a frame the check silently does not run; with the wrong
-        frame it resolves `goto out;` against an `out:` in a different function.
-        Both failure modes appeared on the benchmark corpus: 423 findings, then
-        284 after scoping labels per function, then 192 after dropping the
-        file-global fallback -- all of them wrong, and the residue coming from
-        functions whose frames merged.
-
-        Worse, the surviving check was invisible: on a fixture whose functions
-        all had multi-line signatures it reported zero, which reads identically
-        to correct. cppcheck implements 15.2 with a real parser; the KB carries
-        the rule for that path and for deviation records.
-        """
-        return
-
-    @staticmethod
-    def _close_switch(sw: dict, add, clean_lines: list[str] | None = None,
-                      end_line: int | None = None) -> None:
+    def _close_switch(sw: dict, add) -> None:
         """Checks that can only be decided once a switch's whole body is seen."""
         if not sw["saw_default"]:
             add("MISRA 16.4", sw["start"], "switch statement has no default label")
@@ -675,14 +642,6 @@ class NativeAnalyzer(Analyzer):
         # it has.
         switch_stack: list[dict] = []
         depth = 0
-        # Rule 15.2 state. Labels are function-scoped in C, and treating them as
-        # file-global is catastrophic here: mbedtls uses `goto cleanup;` in
-        # hundreds of functions, so a file-global lookup resolves every one of
-        # them to the FIRST `cleanup:` in the file and calls the rest backward
-        # jumps -- 423 findings in mbedtls alone, all wrong. Resolution happens
-        # when a function closes, so a label defined later in the same function
-        # still counts as a forward jump.
-
         for i, line in enumerate(clean_lines, start=1):
             raw = raw_lines[i - 1] if i <= len(raw_lines) else ""
 
@@ -708,20 +667,18 @@ class NativeAnalyzer(Analyzer):
                         and not _CTRL_HDR_RE.match(nxt) and not _ELSE_HDR_RE.match(nxt):
                     add("MISRA 15.6", i,
                         "control statement body is not a compound (braced) block")
+            # Rule 15.2 (a goto must jump forward) is deliberately NOT
+            # implemented. Labels are function-scoped in C, so the rule is only
+            # decidable with reliable function boundaries. Resolving labels
+            # against a file-global table, or against a function frame that
+            # merged with a neighbour, produced hundreds of wrong findings on
+            # mbedtls (`goto cleanup;` resolved to another function's
+            # `cleanup:`), and with no frame the check silently reported nothing,
+            # which reads the same as correct. cppcheck implements 15.2 with a
+            # real parser; the KB carries the rule for that path and for
+            # deviation records.
             if _GOTO_RE.search(line):
                 add("MISRA 15.1", i, "goto statement")
-            # Only inside a *recognised* function. _FUNC_DEF_RE needs the whole
-            # signature on one line, and mbedtls declares plenty across several
-            # lines -- falling back to a file-global label table there resolved
-            # `goto out;` against an `out:` belonging to a different function
-            # entirely (284 findings in mbedtls, all wrong). Missing a real
-            # backward goto in an unrecognised function is the acceptable
-            # trade: a false negative costs less than a false positive here.
-            if func_stack:
-                if (gm := _GOTO_LABEL_RE.search(line)):
-                    func_stack[-1]["gotos"].append((i, gm.group(1)))
-                if (lm := _LABEL_DEF_RE.match(line)) and lm.group(1) != "default":
-                    func_stack[-1]["labels"].setdefault(lm.group(1), i)
             if _UNION_RE.search(line):
                 add("MISRA 19.2", i, "union declaration")
             if _UNDEF_RE.match(line):
@@ -790,7 +747,6 @@ class NativeAnalyzer(Analyzer):
                     # Read parameters off the JOINED signature, so an array
                     # parameter declared on a wrapped line is still seen.
                     "array_params": _array_param_names(fdef["sig"]),
-                    "gotos": [], "labels": {},
                 }
 
             # float equality: crude but effective — == or != on a line mentioning float vars is
@@ -813,7 +769,7 @@ class NativeAnalyzer(Analyzer):
                 func_stack.append(pending_func)
                 pending_func = None
             while func_stack and func_stack[-1]["depth"] > depth:
-                self._resolve_gotos(func_stack.pop(), add)
+                func_stack.pop()
             if _SWITCH_RE.search(line):
                 switch_stack.append({"start": i, "depth": depth, "saw_default": False,
                                      "cases": 0, "labels": [], "body_depth": None})
@@ -846,13 +802,10 @@ class NativeAnalyzer(Analyzer):
                             "case/default label is nested inside an inner block "
                             "rather than the switch's own compound statement")
             while switch_stack and depth < switch_stack[-1]["depth"]:
-                self._close_switch(switch_stack.pop(), add, clean_lines, i)
+                self._close_switch(switch_stack.pop(), add)
 
         for sw in switch_stack:  # unterminated at EOF
-            self._close_switch(sw, add, clean_lines, len(clean_lines) + 1)
-
-        for fn in func_stack:   # functions still open at EOF
-            self._resolve_gotos(fn, add)
+            self._close_switch(sw, add)
 
         self._preprocessor_checks(raw_lines, clean_lines, add)
 

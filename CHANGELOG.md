@@ -84,6 +84,9 @@ All notable changes to Maisha are documented here. Format loosely follows
   before, so existing fingerprints stay valid).
 
 ### Changed
+- Native analyzer: removed dead Rule 15.2 bookkeeping (no-op `_resolve_gotos`, unused goto/label
+  tables and regexes) and stale comments; detections unchanged. Rule 15.2 stays documented as
+  not implemented natively.
 - **MCP server:** tool bodies run on a worker thread (serialized by a lock) so a long scan
   no longer blocks the event loop. Path arguments (`paths`, `include_paths`, `exclude`,
   `compile_commands`, `-I` flags, SARIF `path`) must stay inside the project root unless
