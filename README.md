@@ -1,275 +1,277 @@
 <p align="center"><img src="assets/banner.svg" alt="Maisha — MISRA, BARR-C and CERT C compliance harness" width="100%"></p>
 
-# Maisha
+<p align="center">
+  <a href="https://github.com/WinterLabsHQ/maisha/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/WinterLabsHQ/maisha/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://pypi.org/project/maishac/"><img alt="PyPI" src="https://img.shields.io/pypi/v/maishac?label=PyPI"></a>
+  <a href="https://pypi.org/project/maishac/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/maishac"></a>
+  <a href="https://github.com/WinterLabsHQ/maisha/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/WinterLabsHQ/maisha?label=release"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-green"></a>
+</p>
 
-[![CI](https://github.com/WinterLabsHQ/maisha/actions/workflows/ci.yml/badge.svg)](https://github.com/WinterLabsHQ/maisha/actions/workflows/ci.yml)
-&nbsp;[![Release](https://img.shields.io/github/v/release/WinterLabsHQ/maisha?label=release)](https://github.com/WinterLabsHQ/maisha/releases/latest)
-&nbsp;![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
-&nbsp;![License: MIT](https://img.shields.io/badge/license-MIT-green)
+<h1 align="center">Maisha</h1>
 
-> ### Searching for an open-source alternative to Polyspace, Helix QAC or Coverity for MISRA C? **This is it.** Free, vendor-neutral, and driven from your IDE. → [`pipx install maishac`](#install)
+<p align="center"><b>An open-source compliance workflow for MISRA C:2012, BARR-C:2018 and CERT C,<br>driven from any agentic IDE.</b></p>
 
-**The open-source compliance-workflow layer for MISRA C:2012, BARR-C:2018 and CERT C — usable from any agentic IDE.**
+<p align="center">
+  <a href="#-60-second-quick-start">Quick start</a> ·
+  <a href="#-how-it-works">How it works</a> ·
+  <a href="#-command-reference">Commands</a> ·
+  <a href="#-use-it-from-your-ide-mcp">MCP setup</a> ·
+  <a href="#-ci-gating">CI</a> ·
+  <a href="#-scope-and-limitations">Limitations</a>
+</p>
 
-Maisha is the free, vendor-neutral alternative to the paid compliance *workflow*
-that tools like Polyspace, Helix QAC, Coverity and Parasoft now sell as agentic
-toolkits: the fix loop, verification gate, deviation & audit-evidence workflow,
-and author-time guidance — running on free engines (cppcheck + clang-tidy) **or**
-layered on top of a qualified engine you already own (via SARIF). It is *not* a
-qualified detection engine and does not pretend to be. → See
-[**How Maisha compares**](COMPARISON.md).
+> [!WARNING]
+> **Maisha is a workflow orchestrator and audit-trail layer, not a qualified or certified static-analysis tool.** Its findings do not by themselves satisfy tool-qualification requirements for DO-178C, ISO 26262 or IEC 62304, and running it is not a formal compliance certification. Use it *upstream* of a qualified engine. See [Scope and limitations](#-scope-and-limitations).
 
-> *Maisha* is Swahili for **"life."** Compliance standards like MISRA and CERT C
-> exist because this is the software that flies planes, drives cars and runs
-> medical devices — code where a defect costs lives, not uptime. The name is the
-> goal the tool works toward. The CLI and package are `maishac` (*Maisha-for-C*).
+Searching for an open-source alternative to Polyspace, Helix QAC or Coverity for the MISRA C *workflow*? Maisha provides the fix loop, verification gate, deviation and audit-evidence handling, and author-time guidance that those vendors now sell as agentic toolkits. It runs on free engines (cppcheck, clang-tidy, gcc/clang warnings and a native analyzer) or sits on top of a qualified engine you already own, through SARIF. It is not a qualified detection engine and does not pretend to be. See [How Maisha compares](COMPARISON.md).
 
-> ⚠️ **Maisha is a workflow orchestrator and audit-trail layer, not a qualified/certified static-analysis tool.** Its findings do **not** by themselves satisfy tool-qualification requirements for DO-178C, ISO 26262 or IEC 62304, and running it is not a formal compliance certification. It is best used *upstream* of a qualified engine (see [Scope & Limitations](#scope--limitations)).
+> *Maisha* is Swahili for **"life."** MISRA and CERT C exist because this is the software that flies planes, drives cars and runs medical devices. The CLI and package are `maishac` (*Maisha-for-C*).
 
-Maisha is not another linter. It is the *deterministic half* of an autonomous
-compliance workflow. Your IDE's LLM (Claude Code, Cursor, Windsurf, Zed, anything
-that speaks [MCP](https://modelcontextprotocol.io)) does the code edits; Maisha
-does everything that must never hallucinate:
+## Contents
 
-- **Scanning & evidence merging** — a zero-dependency native analyzer plus adapters
-  for `cppcheck` (with its MISRA addon) and `clang-tidy` (`cert-*` checks). Findings
-  from multiple analyzers that hit the same defect are fingerprint-merged into a
-  single finding with reinforcing evidence (`analyzer: native+cppcheck`).
-- **Proactive authoring (write it compliant the first time)** — two author-time
-  surfaces, so an agent writes compliant code on the first pass instead of fixing
-  it on a later scan:
-  - `compliance_guidance` (CLI: `maishac guide "<topic>"`) — a compliant-pattern
-    library: *before* writing code for a concern (dynamic memory, string copy,
-    switch, recursion, integer overflow, …) it returns the idiom to **prefer**,
-    the anti-pattern to **avoid**, **why**, and the MISRA/CERT/BARR-C rules it
-    satisfies.
-  - `compliance_check_snippet` (CLI: `maishac check`) — lints a draft *in memory,
-    before it is written to a file*, returning violations, fix hints, and the
-    compliant idiom to swap in. (Native lexical checks only — the syntactic
-    subset, not whole-program rules; a clean snippet is not a compliance
-    guarantee.)
+- [Why Maisha](#-why-maisha)
+- [60-second quick start](#-60-second-quick-start)
+- [How it works](#-how-it-works)
+- [Features](#-features)
+- [Command reference](#-command-reference)
+- [Use it from your IDE (MCP)](#-use-it-from-your-ide-mcp)
+- [CI gating](#-ci-gating)
+- [The verification gate and trust model](#-the-verification-gate-and-trust-model)
+- [Reading the reports](#-reading-the-reports)
+- [Example output](#-example-output)
+- [Rule coverage](#-rule-coverage)
+- [Scope and limitations](#-scope-and-limitations)
+- [Install options](#-install-options)
+- [Documentation map](#-documentation-map)
+- [Development and contributing](#-development-and-contributing)
+- [License and disclaimer](#-license-and-disclaimer)
 
-  See [`AUTHORING_PLAYBOOK.md`](AUTHORING_PLAYBOOK.md) for the guidance → draft →
-  check → rewrite protocol to hand your IDE agent.
-- **Stable fingerprints** — findings are identified by
-  `sha1(rule + file + normalized line content + enclosing function)`, *not* line
-  numbers, so they survive edits, insertions and refactors across sessions.
-- **Persistent memory** — a SQLite store per project (`.maishac/memory.db`)
-  tracking finding lifecycle (open → resolved → regressed), every fix attempt and
-  its outcome, false-positive suppressions, MISRA-style deviation records with
-  justification/approver/expiry, and free-form project convention notes.
-- **An engineered fix loop** — sessions with severity-ranked, file-grouped batches;
-  regressions always jump the queue; each finding is briefed with the rule summary,
-  a fix hint, strategies that *already failed* on it, relevant memory notes and
-  cross-standard equivalents. Guard rails: iteration budgets, stall detection, and
-  oscillation freezing (a finding that regresses twice is frozen as `needs_human`).
-- **A verification gate** — a fix is not `resolved` just because the analyzer
-  stopped flagging it. It enters `pending_verification` until a passing test run
-  or an explicit human approval confirms it; semantic-risk and high-severity
-  findings always require human sign-off. See [below](#the-verification-gate).
-- **Reporting** — per-standard compliance matrices, a markdown report with a
-  deviation register, SARIF 2.1.0 export with `partialFingerprints` for CI, and
-  the **MISRA Compliance:2020 evidence set** — the three documents a
-  functional-safety assessor asks for: the **Guideline Compliance Summary**
-  (every guideline Compliant / Deviations / Violations / Disapplied, tied to
-  deviation permits), the **Guideline Enforcement Plan** (how each guideline is
-  checked + a tool inventory with versions/options), and the **Guideline
-  Re-categorization Plan** (with the legality rules enforced — a Mandatory
-  guideline may not be re-categorized, a Required one may not drop to
-  Advisory/Disapplied), plus honest disclosure of which guidelines are *not
-  checked*.
+## 🎯 Why Maisha
 
-The three rule knowledge bases (**214 rules** — 72 MISRA C:2012, 20 BARR-C:2018,
-122 CERT C) contain **original paraphrased
-summaries** written for this project — no standard text is reproduced. For
-authoritative wording you still need the official MISRA / BARR / SEI CERT documents.
+An LLM agent can edit C code quickly, but it should not be the one deciding whether the code is compliant. Maisha is the deterministic half of that workflow: everything that must never hallucinate.
 
----
+| Problem with agent-driven compliance | What Maisha does |
+|---|---|
+| Line numbers shift, so history is lost | Findings have stable fingerprints: `sha1(rule + file + normalized line + enclosing function)` |
+| The analyzer that missed a bug also judges the fix | Fixes enter `pending_verification` and need a test run or a human sign-off |
+| An agent can approve its own work | MCP sign-offs are only *proposals*; a person finalizes them with `maishac proposals` |
+| A crashed or missing analyzer looks like a clean scan | A failed analyzer clears nothing; reports say `Not checked`, never "compliant" |
+| Agents loop forever on the same finding | Iteration budgets, stall detection and oscillation freezing end every session in a defined state |
+| Auditors want evidence | Append-only audit log, deviation register, SARIF 2.1.0 and the MISRA Compliance:2020 document set |
 
-## Scope & Limitations
-
-**What Maisha *is*:**
-
-- A **workflow orchestrator** for agent-driven compliance triage and fix loops.
-- A **persistent audit-trail layer**: finding lifecycle, fix attempts, deviation
-  records, suppressions, and a verification gate that records *how* every fix was
-  confirmed (test run vs. human sign-off, and by whom).
-- A **pre-certification cleanup** tool that catches and helps fix the obvious
-  violations early — in the IDE loop, before code reaches a qualified engine.
-
-**What Maisha is *not*:**
-
-- **Not a qualified or certified analysis tool.** Its engines are the
-  open-source cppcheck + clang-tidy + a native analyzer — none carry a tool
-  qualification kit. DO-178C / ISO 26262 / IEC 62304 generally require the
-  analysis tool *itself* to be qualified or proven-in-use; Maisha does not
-  meet that bar and does not claim to.
-- **Not complete rule coverage.** 214 curated rules across three standards is a
-  fraction of MISRA C:2012 (roughly 175 rules/directives with amendments; the
-  figure is approximate and depends on the amendments adopted) or CERT C.
-  Of those, 107 are *enforced* (some analyzer detects them) and 107 are
-  *reference* entries carried for cross-standard equivalence, deviation records
-  and SARIF import — they are not something Maisha finds for you.
-  Detection is bounded by the underlying engines, not the curated set. Every
-  covered rule and which analyzer backs it is listed in
-  [COVERAGE.md](COVERAGE.md) (generated from the code, so gaps are explicit).
-  A real-world run against the FreeRTOS kernel — with a measured false-positive
-  rate and the tool bugs it surfaced — is in [BENCHMARKS.md](BENCHMARKS.md).
-  Headline lesson: **pass your include paths to cppcheck/clang-tidy** with
-  `--include`/`-I` (repeatable), or most of the substantive findings are
-  configuration false positives. A from-scratch accuracy/reliability suite —
-  ground-truthed fixtures, a full fix-loop simulation, SARIF import, CLI
-  end-to-end and edge-case tests — is in
-  [BENCHMARK-SUITE-REPORT.md](BENCHMARK-SUITE-REPORT.md).
-- **Reports say what was not checked.** A guideline no analyzer examined in the
-  last recorded scan is reported as **`Not checked`**, never as compliant. The
-  verdict is `NOT ASSESSED` before any scan and otherwise reads `NO VIOLATIONS
-  FOUND IN CHECKED GUIDELINES (N unchecked)`; plain `COMPLIANT` is only reachable
-  when nothing is unchecked, which in practice means never. An analyzer that
-  crashes, times out or is not installed is a failed *analysis*, not a clean
-  one: its findings are not closed, and the scan reports `analyzer_errors` and
-  a `coverage_warning`. See [Reading the reports](#reading-the-reports).
-- **Not a substitute for human review.** By default a fix is never marked
-  `resolved` on a clean rescan alone — a passing test run or an explicit human
-  approval is required, and semantic-risk / high-severity findings *always*
-  require human sign-off (see [The verification gate](#the-verification-gate)).
-
-**Recommended use for certification pipelines:** run Maisha's loop for early,
-agent-driven cleanup, then hand off to a qualified engine (Astrée, Polyspace,
-Helix QAC, Parasoft C/C++test, IAR C-STAT) for the evidence an auditor accepts.
-Those engines emit SARIF, and `maishac import findings.sarif` layers Maisha's
-loop, memory, verification gate and deviation register on top of their findings —
-recognized MISRA/CERT ruleIds map onto the knowledge base, and imported findings
-are never cleared by a native rescan.
-
-**Robust across real engine dialects.** Qualified engines rarely put the
-MISRA/CERT number in `ruleId` — Helix QAC / Coverity emit a checker-specific id
-(e.g. `ABV.GENERAL`), reference the rule by `ruleIndex`, and attach the guideline
-through `relationships` into a `taxonomies` component. Maisha's importer resolves
-the rule via `result.rule` / `ruleIndex` / `ruleId`, follows relationships and
-taxonomies (and result-level `taxa`) to recover the real guideline, honors
-`defaultConfiguration` levels, skips non-defect results (`kind: pass`,
-`notApplicable`) and baseline-`absent` findings, tolerates missing regions and
-multi-location results, and normalizes scheme-prefixed URIs.
-
-**Rich SARIF mapping.** Import isn't lossy: a qualified engine's `codeFlows`
-(the data-flow path *to* the defect) are parsed and surfaced in the agent
-briefing, so a fixer sees how a defect flows, not just where it lands; and
-`result.suppressions` are honored so a team's existing triage/baseline carries
-over instead of resurfacing as fresh violations. Export emits cross-standard
-equivalences as SARIF `reportingDescriptor.relationships` (e.g. a MISRA rule
-linked to its CERT equivalent), with every relationship target present as a
-descriptor. Maisha's own identity travels in `partialFingerprints`
-(`maishac/v1`), and `startColumn` + code flows survive an import → export
-round-trip, so re-exporting a qualified engine's findings loses nothing.
-
----
-
-## Install
+## ⚡ 60-second quick start
 
 Requires Python 3.10+.
 
 ```bash
-pipx install maishac      # isolated CLI install (recommended)
-# or
-pip install maishac
-```
-
-This installs the `maishac` CLI and the `maishac` Python package. Verify with
-`maishac --help`.
-
-The MCP server is an **optional extra** (scan, gate, reports and sessions need no
-third-party packages). To run `maishac serve`, install it with:
-
-```bash
-pipx install 'maishac[mcp]'      # or: pip install 'maishac[mcp]'
-```
-
-The extra pins `mcp>=1.2.0,<2` (mcp 2.x removed the `FastMCP` module Maisha uses).
-Without it, `maishac serve` exits with that install hint.
-
-**Or run it as a container** (batteries included — cppcheck's MISRA addon and
-clang-tidy are baked in, so no host setup):
-
-```bash
-docker run --rm -v "$PWD:/work" ghcr.io/winterlabshq/maisha scan src/
-docker run --rm -i ghcr.io/winterlabshq/maisha serve      # MCP server over stdio
-```
-
-To hack on Maisha itself:
-
-```bash
-git clone https://github.com/WinterLabsHQ/maisha.git
-cd maisha
-pip install -e ".[dev,mcp]"   # editable install with pytest + the MCP server
-```
-
-Optional but strongly recommended external analyzers — native works with
-zero dependencies, but cppcheck (MISRA addon) and clang-tidy (`cert-*`
-checks) meaningfully increase coverage:
-
-```bash
-# Debian/Ubuntu
-apt install cppcheck clang-tidy
-
-# or, without root, anywhere pip works (prebuilt wheels, incl. Windows/macOS)
-pip install cppcheck clang-tidy
-```
-
-Maisha degrades gracefully: any analyzer not on `PATH` is skipped and the
-native analyzer always works. Run `maishac scan` once and check
-`analyzers_used` in the output to confirm what's actually active.
-
-## Quickstart (CLI)
-
-> Full setup, including the external analyzers and MCP wiring for your
-> editor or agent: **[INSTALL.md](INSTALL.md)**.
-
-```bash
+pipx install maishac              # or: pip install maishac
 cd your-firmware-project
 
-maishac doctor                     # what will this machine actually detect?
+maishac doctor                    # which analyzers and rules are active on this machine?
+maishac scan src/                 # scan and sync project memory (.maishac/memory.db)
+maishac findings --limit 20       # ranked open findings
+maishac rule "MISRA 21.3"         # explain a rule, with cross-standard references
+```
 
-maishac scan src/                  # one-shot scan, syncs memory
-# headers outside src/ (e.g. a vendor SDK or FreeRTOSConfig.h)? forward them:
+Headers outside the scanned paths cause false positives in cppcheck and clang-tidy, so forward them with `--include`/`-I` (repeatable):
+
+```bash
 maishac scan src/ --include include/ --include vendor/sdk/inc
+```
 
-maishac findings --limit 20        # ranked open findings
-maishac rule "MISRA 21.3"          # explain a rule + cross-standard refs
+Then start an engineered fix session:
 
-# The engineered loop (what an agent drives via MCP):
-maishac session begin src/ --verification-policy human_gated
-# -> {"session_id": "abc123...", ...} — use that id below
-maishac session batch abc123       # next prioritized batch with briefings
-# ...edit code (you or your agent)...
-maishac session verify abc123      # rescan, diff, grade attempts, run the test gate
-maishac approve <fingerprint> --by lead@example.com   # human sign-off on a verified fix
-maishac session status abc123
+```bash
+maishac session begin src/ --verification-policy human_gated   # prints a session_id
+maishac session batch <id>        # next prioritized batch, with briefings
+# ...you or your agent edit code...
+maishac session verify <id>       # rescan, diff, grade attempts, run the gate
+maishac approve <fingerprint> --by lead@example.com            # human sign-off
+maishac session status <id>
+```
 
+> [!NOTE]
+> Scan, gate, reports and sessions need **no third-party packages**. The MCP server is an optional extra: `pip install 'maishac[mcp]'`. cppcheck and clang-tidy are optional too; Maisha skips any analyzer that is not on `PATH` and tells you so.
+
+## 🔁 How it works
+
+### The fix loop
+
+```mermaid
+flowchart LR
+    A[scan<br/>4 analyzers] --> B[session begin<br/>baseline + budgets]
+    B --> C[next batch<br/>regressions first]
+    C --> D[agent or human<br/>edits code]
+    D --> E[record attempt]
+    E --> F[verify<br/>rescan + diff]
+    F --> G{fix confirmed?}
+    G -->|"test passes or<br/>human approves"| H[resolved]
+    G -->|not yet| I[pending_verification]
+    I -->|"maishac approve /<br/>proposals accept"| H
+    F -->|still open| C
+    F -->|"budget spent, stalled,<br/>no progress"| J[session ends:<br/>stalled / budget_exhausted /<br/>needs_human]
+    F -->|"analyzer failed"| K[analysis_incomplete]
+    K -->|fix toolchain| F
+    H --> L{anything open<br/>in scope?}
+    L -->|no| M[converged]
+    L -->|yes| C
+```
+
+### Architecture
+
+```mermaid
+flowchart TB
+    subgraph IDE["Agentic IDE (Claude Code, Cursor, Windsurf, Zed, any MCP client)"]
+        LLM[LLM agent<br/>edits code, records attempts]
+    end
+    subgraph CLI["Terminal / CI"]
+        H[human<br/>maishac CLI]
+    end
+    LLM -- "MCP (stdio)" --> S[mcp_server]
+    S --> E
+    H --> E
+    subgraph M["maishac"]
+        E[engine<br/>sessions, batching, budgets,<br/>stall + oscillation guards]
+        A[analyzers<br/>native, cppcheck, clang-tidy, compiler]
+        R[rules<br/>MISRA + BARR-C + CERT KBs<br/>fuzzy resolver, cross-references]
+        DB[(memory<br/>SQLite .maishac/memory.db)]
+        REP[report<br/>matrix, markdown, SARIF,<br/>MISRA Compliance:2020 set]
+        E --> A
+        E --> R
+        E --> DB
+        DB --> REP
+    end
+    EXT[external engine<br/>SARIF file] -- "maishac import" --> E
+```
+
+Design principles:
+
+1. **Determinism where it matters.** Prioritization, verification, memory and budgets are code, not prompts.
+2. **Findings are identities, not line numbers.** History stays attached to the defect through refactors.
+3. **The loop must terminate.** Budgets, stall limits and oscillation freezing guarantee a defined end state.
+4. **Compliance is a process, not a scan.** Deviations and suppressions are first-class, auditable records.
+
+## ✨ Features
+
+| Area | What you get |
+|---|---|
+| **Four analyzers** | `native` (zero dependencies), `cppcheck` (MISRA addon), `clang-tidy` (`cert-*` checks), `compiler` (gcc/clang warnings). Findings that hit the same defect are fingerprint-merged into one (`analyzer: native+cppcheck`). |
+| **Explicit analyzer outcomes** | A crashed, timed-out or missing analyzer is a failed *analysis*. It clears nothing, and the scan reports `analyzer_errors` and a `coverage_warning`. A session whose rescan was partial ends `analysis_incomplete`. |
+| **Author-time guidance** | `maishac guide "<topic>"` returns the idiom to prefer, the anti-pattern to avoid, why, and the rules it satisfies. `maishac check` lints a draft in memory before it is written. Protocol: [AUTHORING_PLAYBOOK.md](AUTHORING_PLAYBOOK.md). |
+| **Persistent memory** | SQLite per project: finding lifecycle (open, resolved, regressed), every fix attempt and its outcome, suppressions, deviations with justification, approver and expiry, notes, scans. |
+| **Engineered fix loop** | Severity-ranked, file-grouped batches. Regressions jump the queue. Each briefing carries the rule summary, a fix hint, strategies that already failed, memory notes and cross-standard equivalents. |
+| **Verification gate** | A fix is not `resolved` because a warning stopped firing. See [the gate](#-the-verification-gate-and-trust-model). |
+| **Sign-off integrity** | Agents propose, humans decide. Mandatory MISRA guidelines can never be suppressed or deviated. Append-only audit log and CLI-only revocation. |
+| **Honest reporting** | `Not checked` status, `NOT ASSESSED` and `NO VIOLATIONS FOUND IN CHECKED GUIDELINES (N unchecked)` verdicts, a `scans` table and last-scan section. See [Reading the reports](#-reading-the-reports). |
+| **MISRA Compliance:2020 evidence** | Guideline Compliance Summary, Guideline Enforcement Plan (lists only tools that actually check a guideline) and Guideline Re-categorization Plan, with legality rules enforced. |
+| **SARIF in and out** | Export SARIF 2.1.0 with `partialFingerprints`. Import a qualified engine's SARIF (Helix QAC, Coverity and others), including `codeFlows` and `suppressions`, and run the same loop on it. |
+| **CI gate** | `maishac scan --fail-on <severity\|any\|none>` and `maishac gate`, with exit codes 0, 1 and 2. |
+
+<details>
+<summary><b>SARIF import details</b></summary>
+
+Qualified engines rarely put the MISRA/CERT number in `ruleId`. Helix QAC and Coverity emit a checker-specific id (for example `ABV.GENERAL`), reference the rule by `ruleIndex`, and attach the guideline through `relationships` into a `taxonomies` component. The importer resolves the rule through `result.rule`, `ruleIndex` and `ruleId`, follows relationships, taxonomies and result-level `taxa`, honors `defaultConfiguration` levels, skips non-defect results (`kind: pass`, `notApplicable`) and baseline-`absent` findings, tolerates missing regions and multi-location results, and normalizes scheme-prefixed URIs.
+
+Import is not lossy. `codeFlows` (the data-flow path to the defect) appear in the agent briefing, and `result.suppressions` are honored so an existing triage baseline carries over. Export emits cross-standard equivalences as `reportingDescriptor.relationships`, and `startColumn` plus code flows survive an import and export round trip. Imported findings are never cleared by a native rescan. Suppressions inside a SARIF file are not carried over when an agent starts the import; run `maishac import` yourself.
+
+</details>
+
+## 🧰 Command reference
+
+Run `maishac <command> --help` for every flag. Global option: `--project/-p` (project root, default: current directory).
+
+| Command | Purpose |
+|---|---|
+| `doctor` | Diagnose install, analyzer toolchain, rule coverage on this machine, and project memory |
+| `scan <paths>` | Scan and sync memory. Options below |
+| `gate <paths>` | CI gate; alias of `scan --fail-on any` |
+| `findings` | List ranked open findings (`--limit`) |
+| `rule <id>` | Explain a rule, with cross-standard references |
+| `guide <topic>` | Author-time guidance: the compliant idiom to use before writing code |
+| `check` | Lint a draft snippet in memory from a file or stdin; nothing is stored |
+| `session begin\|batch\|verify\|status\|abort` | Engineered fix-loop sessions |
+| `approve <fingerprint> --by <who>` | Human sign-off on a `pending_verification` finding |
+| `deviate`, `suppress`, `recategorize` | Record a deviation, a false-positive suppression, or a GRP re-categorization |
+| `revoke-deviation`, `unsuppress`, `uncategorize` | Revocations (CLI-only, audited) |
+| `proposals list\|accept\|reject` | Review sign-offs an MCP agent proposed |
+| `audit` | Append-only history of sign-offs and sessions (`--json`, `--action`) |
+| `note` | Persist a project convention note |
+| `import <file.sarif>` | Import findings from an external engine |
+| `report --format ...` | `markdown`, `json`, `sarif`, `misra-compliance` (GCS), `gep`, `grp` |
+| `serve` | Run the MCP server over stdio (needs the `mcp` extra) |
+
+<details>
+<summary><b>Scan options</b></summary>
+
+| Option | Meaning |
+|---|---|
+| `--analyzers a,b` | Comma list from `native,cppcheck,clang-tidy,compiler` |
+| `--include/-I DIR` | Include directory forwarded to cppcheck, clang-tidy and the compiler (repeatable) |
+| `--exclude PATTERN` | fnmatch pattern of directories/files to skip (repeatable), added to the defaults (`.git`, `.maishac`, `build`, `dist`, `node_modules`, ...) |
+| `--no-default-excludes` | Do not skip the default directories |
+| `--std STD` | C standard for compiler and clang-tidy checks (default `c11`) |
+| `--compiler-flag FLAG` | Extra flag such as `-DNDEBUG` or `-Iinc` (repeatable; only `-D/-U/-I/-isystem/-iquote/-std=` and a few target flags are accepted) |
+| `--compile-commands FILE` | Take per-file `-D/-I/-std` flags from a `compile_commands.json` |
+| `--fail-on SEVERITY` | CI gate: `blocker\|critical\|major\|minor\|info\|any\|none` |
+| `--allow-degraded` | With `--fail-on`: do not exit 2 for a degraded analysis |
+
+`session begin` accepts the same scan options plus `--max-iterations`, `--batch-size`, `--severity-floor`, `--verification-policy`, `--test-command`, `--test-timeout` and `--force`. `session abort` takes `--reason` and `--by`.
+
+</details>
+
+<details>
+<summary><b>Recording decisions: deviations, suppressions, re-categorization, notes</b></summary>
+
+```bash
 maishac deviate "MISRA 19.2" --scope "drivers/**" \
     --justification "Union required for hardware register overlay mapping" \
     --approver lead@example.com --expires 2027-01-01
 maishac suppress <fingerprint> --reason "false positive: macro expansion" --approver lead@example.com
-maishac unsuppress <fingerprint> --by lead@example.com          # revocations are audited too
-maishac revoke-deviation <deviation-id> --by lead@example.com
-maishac uncategorize "MISRA 15.1" --by lead@example.com
-maishac proposals list                                          # sign-offs an MCP agent asked for
-maishac proposals accept <id> --by lead@example.com             # ...and the human decision
-maishac audit                                                   # append-only history of every sign-off
-maishac note "This codebase uses FreeRTOS; heap_4 allocator is approved" --tags misra-21.3
 maishac recategorize "MISRA 15.1" --to disapplied \
     --rationale "No goto in this codebase; disapplied by acquirer/supplier agreement" \
     --approver lead@example.com
+maishac note "This codebase uses FreeRTOS; heap_4 allocator is approved" --tags misra-21.3
+
+# revocations stay in the audit log
+maishac unsuppress <fingerprint> --by lead@example.com
+maishac revoke-deviation <deviation-id> --by lead@example.com
+maishac uncategorize "MISRA 15.1" --by lead@example.com
+
 maishac report --format sarif > compliance.sarif
 maishac report --format misra-compliance > gcs.md   # Guideline Compliance Summary
-maishac report --format gep > gep.md                 # Guideline Enforcement Plan
-maishac report --format grp > grp.md                 # Guideline Re-categorization Plan
+maishac report --format gep > gep.md                # Guideline Enforcement Plan
+maishac report --format grp > grp.md                # Guideline Re-categorization Plan
 ```
 
-## Quickstart (any agentic IDE, via MCP)
+A deviation needs a justification of at least 15 characters and a suppression a reason of at least 10. Recategorization legality is enforced: a Mandatory guideline cannot be re-categorized, and a Required one cannot drop to Advisory or Disapplied. An expired deviation permit no longer counts.
 
-Add the server to your IDE's MCP configuration (ready-made snippets in
-[`integrations/`](integrations/)):
+</details>
+
+<details>
+<summary><b>Session states</b></summary>
+
+| State | Meaning |
+|---|---|
+| `active` | In progress |
+| `awaiting_verification` | Fixes are pending a test run or human sign-off |
+| `converged` | Nothing open in scope (imported findings do not block) |
+| `stalled` / `budget_exhausted` | No progress over the stall window / iteration budget spent |
+| `needs_human` | Every remaining finding is frozen by the oscillation guard (a finding that regresses twice) |
+| `analysis_incomplete` | The rescan could not run every analyzer, so "nothing left" cannot be concluded. Not terminal: fix the toolchain and `session verify` again |
+| `aborted` | Ended on purpose with `maishac session abort <id>` |
+
+Ended sessions refuse `next_batch`, `verify` and `record_attempt`. `verify` respects the session's `--severity-floor` and paths; findings outside them are reported as `open_out_of_scope`. `session begin` refuses to start while another session is active on the project unless you pass `--force`.
+
+</details>
+
+## 🔌 Use it from your IDE (MCP)
+
+Install the extra, then add the server to your IDE's MCP configuration:
+
+```bash
+pipx install 'maishac[mcp]'      # or: pip install 'maishac[mcp]'
+```
 
 ```json
 {
@@ -277,77 +279,47 @@ Add the server to your IDE's MCP configuration (ready-made snippets in
     "maisha": {
       "command": "maishac",
       "args": ["serve"],
-      "env": { "MAISHAC_PROJECT": "/path/to/your/project" }
+      "env": { "MAISHAC_PROJECT": "/absolute/path/to/your/project" }
     }
   }
 }
 ```
 
-Then tell your agent something like:
+Ready-made files are in [`integrations/`](integrations/): [`claude-code.mcp.json`](integrations/claude-code.mcp.json), [`cursor.mcp.json`](integrations/cursor.mcp.json) (uses `${workspaceFolder}`) and [`generic-mcp.json`](integrations/generic-mcp.json). The extra pins `mcp>=1.2.0,<2`; without it, `maishac serve` exits with an install hint. Then tell your agent something like:
 
-> Begin a Maisha compliance session on `src/`, work through batches until
-> converged, record every attempt, and add deviations only where a fix is
-> genuinely impossible.
+> Begin a Maisha compliance session on `src/`, work through batches until converged, record every attempt, and propose deviations only where a fix is genuinely impossible.
 
-The recommended agent protocol is documented in
-[`AGENT_PLAYBOOK.md`](AGENT_PLAYBOOK.md).
+The recommended agent protocol is in [AGENT_PLAYBOOK.md](AGENT_PLAYBOOK.md).
 
-## MCP tools
+<details>
+<summary><b>MCP tools</b></summary>
 
 | Tool | Purpose |
 |---|---|
-| `compliance_scan` | Scan paths, merge analyzers, sync memory, return diff (new/persisting/resolved/regressed) |
-| `compliance_list_findings` | Ranked open findings above a severity floor |
-| `compliance_get_finding` | Full briefing for one fingerprint (history, failed strategies, notes) |
-| `compliance_explain_rule` | Rule summary, severity, fix hint, cross-standard equivalents |
-| `compliance_search_rules` | Keyword search across all three standards |
-| `compliance_guidance` | **Before** writing code on a concern, get the compliant idiom to reach for (avoid/prefer/why + the rules it satisfies) — the author-time pattern library |
-| `compliance_check_snippet` | Lint a draft snippet **in memory, before writing it** — proactive authoring aid; returns violations, fix hints, and the compliant idiom to swap in; stores nothing |
-| `compliance_begin_session` | Baseline scan + session with budgets (`max_iterations`, `batch_size`) |
-| `compliance_next_batch` | Next prioritized batch, regressions first, with per-finding briefings |
+| `compliance_scan` | Scan paths, merge analyzers, sync memory, return the diff |
+| `compliance_list_findings` / `compliance_get_finding` | Ranked open findings / full briefing for one fingerprint |
+| `compliance_explain_rule` / `compliance_search_rules` | Rule summary and cross-references / keyword search |
+| `compliance_guidance` | Before writing code: the compliant idiom for a concern |
+| `compliance_check_snippet` | Lint a draft in memory, before it is written; stores nothing |
+| `compliance_doctor` | Toolchain and coverage diagnosis |
+| `compliance_begin_session` / `compliance_next_batch` | Baseline scan with budgets / next prioritized batch |
 | `compliance_record_attempt` | Log the strategy used on a finding (auto-graded on verify) |
-| `compliance_verify` | Rescan, diff, grade attempts, run the test gate, advance state machine |
-| `compliance_approve_finding` | **Proposes** a human sign-off moving a `pending_verification` finding to `resolved` (required for semantic-risk / high-severity fixes). Takes effect only when a person runs `maishac proposals accept` (see below) |
-| `compliance_session_status` | Progress, iteration budget, state (`active`/`awaiting_verification`/`converged`/`stalled`/`budget_exhausted`) |
-| `compliance_add_deviation` | **Proposes** a MISRA-style deviation record (justification ≥ 15 chars enforced; never for Mandatory guidelines) |
-| `compliance_recategorize` | **Proposes** a MISRA GRP re-categorization (legality enforced: no Mandatory re-cat; Required→Advisory/Disapplied forbidden) |
-| `compliance_suppress_finding` | **Proposes** marking a fingerprint as false positive (reason ≥ 10 chars; never for Mandatory guidelines) |
-| `compliance_list_proposals` | Sign-off proposals still waiting for a human |
+| `compliance_verify` | Rescan, diff, grade attempts, run the gate, advance the state machine |
+| `compliance_session_status` / `compliance_abort_session` | Progress and state / end a session |
+| `compliance_approve_finding` | **Proposes** a human sign-off for a `pending_verification` finding |
+| `compliance_add_deviation` | **Proposes** a deviation (never for Mandatory guidelines) |
+| `compliance_recategorize` | **Proposes** a GRP re-categorization |
+| `compliance_suppress_finding` | **Proposes** a false-positive suppression (never for Mandatory guidelines) |
+| `compliance_list_proposals` | Proposals still waiting for a human |
+| `compliance_import_sarif` | Ingest an external engine's SARIF into the same loop |
+| `compliance_report` | Markdown, JSON, SARIF, or the MISRA Compliance:2020 set (`misra-compliance`, `gep`, `grp`) |
 | `memory_note` / `memory_search` / `memory_stats` | Project convention memory |
-| `compliance_import_sarif` | Ingest an external engine's SARIF (qualified engine or cppcheck `--output-format=sarif`) into the same loop/memory/gate; **honors `result.suppressions`** so a team's existing triage/baseline carries over instead of resurfacing as fresh violations |
-| `compliance_report` | Markdown, JSON, SARIF 2.1.0, or the MISRA Compliance:2020 evidence set: `misra-compliance` (GCS), `gep` (enforcement plan), `grp` (re-categorization plan) |
 
-## Architecture
+Nothing in the MCP surface can revoke a sign-off or set the test command.
 
-```
-┌──────────────────────────── your agentic IDE ───────────────────────────┐
-│  LLM agent: reads briefings, edits code, records attempts               │
-└──────────────▲──────────────────────────────────────────────────────────┘
-               │ MCP (stdio)
-┌──────────────┴──────────────  maisha  ──────────────────────────────┐
-│ engine/    LoopEngine: sessions, batching, budgets, stall/oscillation   │
-│ memory/    SQLite: findings, fix_attempts, deviations, suppressions,    │
-│            notes, sessions  (.maishac/memory.db)                      │
-│ analyzers/ native (0-dep) + cppcheck(+MISRA addon) + clang-tidy(cert-*) │
-│            → fingerprint-deduped, severity-sorted evidence               │
-│ rules/     MISRA C:2012 + BARR-C:2018 + CERT C KBs, fuzzy resolver,     │
-│            cross-standard references                                     │
-│ report.py  compliance matrix, markdown, SARIF 2.1.0                     │
-└──────────────────────────────────────────────────────────────────────────┘
-```
+</details>
 
-Design principles:
-
-1. **Determinism where it matters.** Prioritization, verification, memory and
-   budgets are code, not prompts. The LLM only does what LLMs are good at.
-2. **Findings are identities, not line numbers.** Fingerprints keep history
-   attached to the defect through refactors.
-3. **The loop must terminate.** Iteration budgets, stall limits and oscillation
-   freezing guarantee a session always ends in a well-defined state.
-4. **Compliance is a process, not a scan.** Deviations and suppressions are
-   first-class, auditable records — exactly as MISRA compliance expects.
-
-## CI gate and exit codes
+## 🚦 CI gating
 
 `maishac scan` exits 0 by default, whatever it finds. To fail a pipeline, ask for it:
 
@@ -359,204 +331,198 @@ maishac scan src/ --fail-on any --allow-degraded
 
 | Exit | Meaning |
 |---|---|
-| 0 | No open finding at or above the threshold, and the analysis was complete |
-| 1 | Open findings at or above `--fail-on` (also: any CLI error such as an unknown session id, a bad argument or a zero-file scan) |
-| 2 | The analysis was **degraded** (an analyzer failed, or a recommended one is not installed) and `--allow-degraded` was not given |
+| `0` | No open finding at or above the threshold, and the analysis was complete |
+| `1` | Open findings at or above `--fail-on`. Also any CLI error, such as an unknown session id, a bad argument or a zero-file scan |
+| `2` | The analysis was **degraded** (an analyzer failed, or a recommended one is not installed) and `--allow-degraded` was not given |
 
-Findings take precedence over degradation (exit 1 beats 2). A degraded pass is
-not a pass: a clean result from a scan that never ran cppcheck says nothing about
-the rules cppcheck covers. Pass `--allow-degraded` only where that is a deliberate
-choice. The scan JSON carries `open_by_severity` and, with the flag, a `gate` block.
+Findings take precedence over degradation (exit 1 beats 2). A degraded pass is not a pass: a clean result from a scan that never ran cppcheck says nothing about the rules cppcheck covers. The scan JSON carries `open_by_severity` and, with the flag, a `gate` block.
 
-## Reading the reports
+<details>
+<summary><b>GitHub Actions example</b></summary>
 
-`compliance_report` / `maishac report`, the Guideline Compliance Summary
-(`misra_compliance_summary`) and the Guideline Enforcement Plan are built from
-recorded evidence, including *which analyzers actually succeeded in the last
-scan* (stored in the `scans` table, with their versions).
+```yaml
+name: misra
+on: [pull_request]
+jobs:
+  maisha:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: sudo apt-get install -y cppcheck clang-tidy
+      - run: pip install maishac
+      - run: maishac scan src/ --include include/ --fail-on major
+      - run: maishac report --format sarif > maisha.sarif
+        if: always()
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with: { sarif_file: maisha.sarif }
+```
+
+Or use the container, which has cppcheck's MISRA addon and clang-tidy baked in:
+
+```bash
+docker run --rm -v "$PWD:/work" ghcr.io/winterlabshq/maisha scan src/ --fail-on major
+```
+
+</details>
+
+## 🔒 The verification gate and trust model
+
+**The trap.** The only judge of a fix is the analyzer whose blind spot may have created the finding. Casting a signed sentinel (`-1` meaning "no limit") to `uint32_t` to silence a signed/unsigned warning turns "no limit" into "an enormous limit". The rescan passes and no static check catches it.
+
+So a fix goes to `pending_verification` and leaves only under the session's `verification_policy`:
+
+| Policy | A pending fix becomes `resolved` when... |
+|---|---|
+| `analyzer_only` | the analyzer stops flagging it (not recommended for compliance work) |
+| `test_gated` | the human-configured test command exits 0 |
+| `human_gated` | a human approves it |
+
+The default is `test_gated` if a test command is configured, else `human_gated`. Whatever the policy, **semantic-risk findings** (casts, comparisons, sign conversions, control-flow changes) and **high-severity findings** always need human approval. A file that vanishes from its path does not resolve its high-severity findings either.
+
+> [!NOTE]
+> The semantic-risk category list is broad, so `test_gated` sessions on typical MISRA findings need human sign-off almost as often as `human_gated` ones. In one simulated session a passing test suite auto-resolved none of eight pending findings; see [BENCHMARK-SUITE-REPORT.md §3.2](BENCHMARK-SUITE-REPORT.md#32-the-gate-is-more-conservative-than-it-looks). Budget review time accordingly.
+
+### Agents propose, humans decide
+
+| Rule | Detail |
+|---|---|
+| MCP sign-offs are proposals | `compliance_approve_finding`, `compliance_add_deviation`, `compliance_recategorize` and `compliance_suppress_finding` create a proposal (`pending_human`). Nothing changes until a person runs `maishac proposals accept <id> --by <who>` (or `reject <id> --by <who> -r "why"`). The accepting person is recorded as approver. |
+| Over MCP, scans are gated | `analyzer_only` is refused, so an agent cannot resolve findings by editing code and rescanning. |
+| Opt-out exists, and is unsafe | `MAISHAC_ALLOW_AGENT_APPROVALS=1` in the server's environment makes those tools act directly. The agent then grades its own work. Entries are stored with `source=mcp`, marked `[AGENT-ORIGINATED]` and flagged in reports. |
+| Mandatory rules are protected | MISRA Mandatory guidelines (judged after GRP re-categorization) can never be suppressed or deviated, in any mode. |
+| Revocation is human-only | `unsuppress`, `revoke-deviation` and `uncategorize` exist only in the CLI. |
+| Everything is logged | Every sign-off, revocation, proposal decision and session start/end goes to an append-only `audit_log` (`maishac audit`). Agent-made actions are marked `[AGENT]`. |
+
+**The test command is human-only.** It runs on your machine, so an MCP agent cannot set it. Configure it with `--test-command`, the `MAISHAC_TEST_COMMAND` environment variable, or `{"test_command": "make test", "test_timeout": 600}` in `.maishac/config.json` (first one found wins, in that order). It is split with `shlex` and run without a shell, so write `sh -c 'a && b'` if you need pipes. The default timeout is 600 s (`--test-timeout`, `MAISHAC_TEST_TIMEOUT`); on timeout the whole process group is killed.
+
+> [!WARNING]
+> `.maishac/config.json` is only human-controlled if the agent cannot write to the project directory. An agent with file-write access can edit that file and the `.maishac/` database directly. If that matters, run the agent in a sandbox that makes `.maishac/` read-only, or set the command with the flag or environment variable.
+
+## 📋 Reading the reports
+
+Reports are built from recorded evidence, including which analyzers actually succeeded in the last scan (stored in the `scans` table with their versions).
 
 | Status / verdict | Meaning |
 |---|---|
-| `Violations` / `Deviations` / `Compliant` / `Disapplied` | Checked in the last scan, with that outcome. A deviation permit that has **expired** no longer counts; the finding is a violation again |
-| `Not checked` | No analyzer that maps to this guideline succeeded in the last recorded scan (or no scan was recorded, or the guideline is reference-only). It says nothing about the code. A not-checked Mandatory guideline is not blocking |
+| `Violations`, `Deviations`, `Compliant`, `Disapplied` | Checked in the last scan, with that outcome. An expired deviation permit no longer counts |
+| `Not checked` | No analyzer that maps to this guideline succeeded in the last recorded scan, no scan was recorded, or the guideline is reference-only. It says nothing about the code |
 | `NOT ASSESSED` | No scan has been recorded |
-| `NO VIOLATIONS FOUND IN CHECKED GUIDELINES (N unchecked)` | The only favourable verdict. Appended with `; last scan degraded or incomplete` and/or `WITH DEVIATIONS` when applicable |
+| `NO VIOLATIONS FOUND IN CHECKED GUIDELINES (N unchecked)` | The only favourable verdict. Gets `; last scan degraded or incomplete` and/or `WITH DEVIATIONS` appended when applicable |
 | `NON-COMPLIANT` / `PENDING` | Open violations (or a Mandatory violation or deviation) / fixes recorded but not yet verified |
 
-The Guideline Enforcement Plan's `checked_by` lists only analyzers that map the
-guideline, with `(not installed)` when absent. Reference-only guidelines read
-*"Not enforced by tooling - requires separate method"*. The compliance matrix
-reports `rules_in_kb`, `rules_detectable` and `clean_among_checked`; `clean` is
-strict (every rule detectable and a non-degraded recorded scan).
-`report --format sarif` uses the real Maisha version, exports suppressed and
-deviated findings with SARIF `suppressions`, and includes the column.
+The Guideline Enforcement Plan's `checked_by` lists only analyzers that map the guideline, with `(not installed)` when absent. Reference-only guidelines read "Not enforced by tooling - requires separate method". The compliance matrix reports `rules_in_kb`, `rules_detectable` and `clean_among_checked`. `report --format sarif` uses the real Maisha version, exports suppressed and deviated findings with SARIF `suppressions`, and includes the column.
 
-## Sessions: states and the audit log
+> [!NOTE]
+> **Upgrading:** `.maishac/memory.db` migrates in place the first time a new version opens it, and old fingerprints stay valid. A scan recorded by an older version has no `scans` row, so reports show `NOT ASSESSED` and `Not checked` until you run one new scan. See [CHANGELOG.md](CHANGELOG.md).
 
-A session ends in one of these states:
+## 📟 Example output
 
-| State | Meaning |
+Produced by running the CLI on [`examples/bad.c`](examples/bad.c), a deliberately non-compliant fixture. Counts depend on which analyzers are installed; this run used `native`, `clang-tidy` and `compiler` (no cppcheck).
+
+```console
+$ maishac findings --limit 5
+[ blocker] CERT STR31-C                 bad.c:25  call to banned function 'strcpy' (unbounded copy)  (3021032318085a9c)
+[ blocker] CERT STR31-C                 bad.c:26  call to banned function 'sprintf' (unbounded format)  (82c284b0036bfcc6)
+[ blocker] CERT ENV33-C                 bad.c:44  call to banned function 'system' (command processor invocation)  (7c47a271bf9c0db2)
+[critical] MISRA-C:2012 Rule 15.6       bad.c:14  control statement body is not a compound (braced) block  (217230e8a8e21358)
+[critical] MISRA-C:2012 Rule 7.3        bad.c:15  lowercase 'l' literal suffix is easily misread as '1'  (8565f97307e5c748)
+```
+
+With cppcheck missing, `maishac scan` prints a coverage warning instead of implying a clean result:
+
+```console
+$ maishac scan bad.c
+WARNING: Reduced coverage: 56/107 detectable rules active (52%).
+  - cppcheck not installed (cppcheck): 51 rule(s) unchecked, e.g. CERT ARR30-C, CERT ARR32-C, CERT DCL30-C
+A clean result here does NOT mean the code is compliant with the rules above - they were never checked. ...
+
+$ maishac gate bad.c > /dev/null; echo $?
+1
+```
+
+## 📊 Rule coverage
+
+The three rule knowledge bases hold **214 rules** with original paraphrased summaries written for this project. No standard text is reproduced.
+
+| Standard | Rules in KB | Enforced (an analyzer detects it) | Reference only |
+|---|---:|---:|---:|
+| MISRA C:2012 | 72 | 71 | 1 |
+| BARR-C:2018 | 20 | 2 | 18 |
+| CERT C | 122 | 34 | 88 |
+| **Total** | **214** | **107** | **107** |
+
+*Reference* entries are carried for cross-standard equivalence, deviation records and SARIF import. Maisha does not find them for you. On a machine with only the zero-dependency tools, `maishac doctor` reports how many enforced rules are reachable (56 of 107 with native, clang-tidy and gcc; installing cppcheck raises that). Every covered rule and the analyzer behind it is listed in [COVERAGE.md](COVERAGE.md), generated from the code so gaps are explicit.
+
+## 🧭 Scope and limitations
+
+**Maisha is** a workflow orchestrator for agent-driven triage and fix loops, a persistent audit-trail layer (including *how* every fix was confirmed and by whom), and a pre-certification cleanup tool for the IDE loop.
+
+**Maisha is not:**
+
+- **A qualified or certified analysis tool.** Its engines are cppcheck, clang-tidy, gcc/clang warnings and a native analyzer. None carries a tool qualification kit. DO-178C, ISO 26262 and IEC 62304 generally require the analysis tool itself to be qualified or proven in use.
+- **Complete rule coverage.** 214 curated rules are a fraction of MISRA C:2012 (roughly 175 rules and directives with amendments; approximate, depends on the amendments adopted) or CERT C. Detection is bounded by the underlying engines, not by the curated set.
+- **A source of "compliant".** A guideline no analyzer examined is `Not checked`. A failed or missing analyzer is a failed analysis, not a clean one.
+- **A substitute for human review.** A clean rescan alone never resolves a fix by default, and semantic-risk and high-severity findings always need a person. Snippet checks (`maishac check`) cover the lexical subset only; a clean snippet is not a compliance guarantee.
+
+**Recommended for certification pipelines:** run Maisha for early, agent-driven cleanup, then hand off to a qualified engine (Astrée, Polyspace, Helix QAC, Parasoft C/C++test, IAR C-STAT) for the evidence an auditor accepts. Those engines emit SARIF, and `maishac import findings.sarif` layers Maisha's loop, memory, gate and deviation register on top of their findings.
+
+Measured accuracy: a run against the FreeRTOS kernel, with a measured false-positive rate and the tool bugs it surfaced, is in [BENCHMARKS.md](BENCHMARKS.md). Its main lesson is to pass your include paths with `--include`/`-I`. A ground-truthed accuracy and reliability suite is in [BENCHMARK-SUITE-REPORT.md](BENCHMARK-SUITE-REPORT.md).
+
+## 📦 Install options
+
+```bash
+pipx install maishac                 # isolated CLI (recommended)
+pip install maishac                  # or into the current environment
+pipx install 'maishac[mcp]'          # plus the MCP server
+```
+
+Optional external analyzers widen coverage. Native always works; anything not on `PATH` is skipped, and `analyzers_used` in the scan output shows what ran.
+
+```bash
+apt install cppcheck clang-tidy      # Debian/Ubuntu
+pip install cppcheck clang-tidy      # no root needed; prebuilt wheels, incl. Windows and macOS
+```
+
+**Container** (cppcheck's MISRA addon and clang-tidy baked in):
+
+```bash
+docker run --rm -v "$PWD:/work" ghcr.io/winterlabshq/maisha scan src/
+docker run --rm -i ghcr.io/winterlabshq/maisha serve      # MCP server over stdio
+```
+
+Full setup, including editor wiring: [INSTALL.md](INSTALL.md).
+
+**Project state.** Memory lives in `.maishac/memory.db` (SQLite, WAL mode with a busy timeout, so a CI scan and a local session can coexist). It is local, machine-specific state: add `.maishac/` to `.gitignore` and share results by exporting a report, not the database.
+
+## 📚 Documentation map
+
+| Document | Contents |
 |---|---|
-| `active` | In progress |
-| `awaiting_verification` | Fixes are pending a test run or human sign-off |
-| `converged` | Nothing open in scope (imported findings do not block) |
-| `stalled` / `budget_exhausted` | No progress over the stall window / iteration budget spent |
-| `needs_human` | Every remaining finding is frozen by the oscillation guard |
-| `analysis_incomplete` | The re-scan could not run every analyzer, so "nothing left" cannot be concluded. Not terminal: fix the toolchain and `session verify` again (becomes `budget_exhausted` if the budget is spent) |
-| `aborted` | Ended on purpose with `maishac session abort <id>` / `compliance_abort_session` |
+| [INSTALL.md](INSTALL.md) | Full setup, analyzers, MCP wiring per editor, CI, troubleshooting |
+| [AGENT_PLAYBOOK.md](AGENT_PLAYBOOK.md) | Protocol to hand your IDE agent for the fix loop |
+| [AUTHORING_PLAYBOOK.md](AUTHORING_PLAYBOOK.md) | Guidance, draft, check, rewrite protocol |
+| [COVERAGE.md](COVERAGE.md) | Every rule and the analyzer that detects it |
+| [COMPARISON.md](COMPARISON.md) | How Maisha compares with commercial tools |
+| [SECURITY.md](SECURITY.md) | Supported versions and vulnerability reporting |
+| [BENCHMARKS.md](BENCHMARKS.md), [BENCHMARK-SUITE-REPORT.md](BENCHMARK-SUITE-REPORT.md), [VALIDATION.md](VALIDATION.md) | Measured accuracy and validation |
+| [CHANGELOG.md](CHANGELOG.md) | Release history and behaviour changes |
+| [CONTRIBUTING.md](CONTRIBUTING.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | Contributing |
 
-Ended sessions refuse `next_batch`, `verify` and `record_attempt`. `verify`
-respects the session's `--severity-floor` and paths; findings outside are
-reported as `open_out_of_scope`. An open imported finding is reported as
-`open_imported` and named in the reason.
-
-Every approval, suppression, deviation, re-categorization, revocation,
-proposal decision and session start/end is written to an append-only `audit_log`
-(`maishac audit [--json] [--action ...]`, and an audit section in the report).
-Actions made by an MCP agent are marked `[AGENT]`. Nothing in the MCP surface
-can revoke: `maishac unsuppress`, `revoke-deviation` and `uncategorize` are
-CLI-only.
-
-## Upgrading an existing project
-
-`.maishac/memory.db` migrates in place the first time the new version opens it
-(`PRAGMA user_version`, currently 4); no action is needed and old fingerprints
-stay valid. A scan recorded by an older version has no `scans` row, so reports
-show `NOT ASSESSED` / `Not checked` until you run one new scan. See the
-CHANGELOG for behaviour changes.
-
-## The verification gate
-
-The trap Maisha guards against: the only judge of a fix is the same analyzer
-whose blind spot may have created the finding. "The warning stopped firing"
-rewards the syntactically minimal edit — often the one most likely to change
-behavior at a boundary. Casting a signed sentinel (`-1` = "no limit") to
-`uint32_t` to silence a signed/unsigned comparison warning turns "no limit" into
-"an enormous limit" — the rescan passes, no static check ever catches it.
-
-So a fix does **not** go straight to `resolved`. It enters
-`pending_verification` and leaves only under the session's **`verification_policy`**:
-
-| Policy | A pending fix becomes `resolved` when… |
-|---|---|
-| `analyzer_only` | the analyzer stops flagging it (⚠️ not recommended for compliance work) |
-| `test_gated` | the human-configured test command exits 0 |
-| `human_gated` | a human calls `approve_finding` |
-
-Default: `test_gated` if a test command is configured, else `human_gated`.
-Over MCP, `analyzer_only` is refused and every scan is gated, so an agent cannot
-resolve findings by editing code and rescanning (`MAISHAC_ALLOW_AGENT_APPROVALS=1`
-lifts this; unsafe). A file that vanishes from its path (moved or renamed) does not
-resolve its high-severity findings either: they wait for a person.
-Regardless of policy, **semantic-risk findings** (casts, comparisons, sign
-conversions, control-flow changes) and **high-severity findings** always require
-human approval — a green test suite that never exercises the sentinel case cannot
-resolve them. Every resolution records how it was confirmed (`analyzer`/`test`/
-`human`) and, for human sign-off, `approved_by`.
-
-> **Set expectations accordingly:** the semantic-risk rule-category list is
-> broad (it covers most of MISRA's essential-type, control-flow and
-> switch-statement rules, plus CERT's `INT`/`FLP` families) — in practice,
-> `test_gated` sessions on typical MISRA findings end up requiring human
-> sign-off almost as often as `human_gated` does. A full end-to-end
-> simulation confirmed a passing test suite auto-resolved **zero** of eight
-> pending findings in one representative session — see
-> [BENCHMARK-SUITE-REPORT.md §3.2](BENCHMARK-SUITE-REPORT.md#32-the-gate-is-more-conservative-than-it-looks).
-> Budget human review time accordingly; don't expect `test_gated` to remove
-> most of the review load.
+## 🤝 Development and contributing
 
 ```bash
-maishac session begin src/ --verification-policy test_gated --test-command "make test"
-# ...agent fixes, then:
-maishac session verify <id>          # -> awaiting_verification if fixes need sign-off
-maishac approve <fingerprint> --by lead@example.com
+git clone https://github.com/WinterLabsHQ/maisha.git && cd maisha
+pip install -e ".[dev,mcp]"          # editable install with pytest and the MCP server
+python -m pytest tests/ -q           # MCP tests skip if the mcp extra is absent
 ```
 
-### Who may sign off: agents propose, humans decide
+Contributions are welcome, especially to the community-extensible parts: a coding-standard **rule**, an authoring **pattern** (compliant idiom), or an **analyzer adapter** or SARIF-dialect mapping. None of these touch the engine. See [CONTRIBUTING.md](CONTRIBUTING.md) for the how-to and the design invariants, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md). Good first issues are labeled on the tracker.
 
-An agent that can approve its own fixes, suppress the findings it cannot fix, or
-write itself a deviation has no gate at all. So the MCP tools
-`compliance_approve_finding`, `compliance_add_deviation`,
-`compliance_recategorize` and `compliance_suppress_finding` **only create a
-proposal** (status `pending_human`). Nothing changes until a person runs
+## 📄 License and disclaimer
 
-```bash
-maishac proposals list
-maishac proposals accept <id> --by lead@example.com   # or: reject <id> --by ... -r "why"
-```
+Released under the [MIT License](LICENSE). Rule summaries are independent restatements written for this project, not reproductions of any standard's text. Rule identifiers and categories are facts used to reference the guidelines; the wording is ours. For authoritative wording you need the official MISRA, BARR and SEI CERT documents.
 
-(or the direct commands `approve` / `deviate` / `suppress` / `recategorize`).
-The person who accepts is recorded as the approver. Every entry also records its
-`source` (`cli`/`mcp`/`import`), and every sign-off, revocation and session
-start/end goes into an append-only `audit_log` (`maishac audit`, and a short
-section in the markdown report).
-
-Setting `MAISHAC_ALLOW_AGENT_APPROVALS=1` in the MCP server's environment makes
-those tools act directly. **This is unsafe**: the agent then grades its own work.
-Such entries are stored with `source=mcp`, marked `[AGENT-ORIGINATED]` in
-reports, and flagged with a warning. MISRA Mandatory guidelines (judged after
-GRP re-categorization) can never be suppressed or deviated, whatever the mode.
-Suppressions inside a SARIF file are not carried over when an agent starts the
-import; use `maishac import` yourself.
-
-### The test command is human-only
-
-The test command runs on your machine, so an MCP agent cannot set it
-(`compliance_begin_session` has no such argument). Configure it with
-`--test-command`, the `MAISHAC_TEST_COMMAND` environment variable, or
-`{"test_command": "make test", "test_timeout": 600}` in `.maishac/config.json`
-(first one found wins, in that order). It is split with `shlex` and run **without
-a shell**; write `sh -c 'a && b'` if you need pipes or `&&`. The default timeout
-is 600 s (`--test-timeout`, `MAISHAC_TEST_TIMEOUT`); on timeout the whole process
-group is killed.
-
-> `.maishac/config.json` is only human-controlled if the agent **cannot write to
-> the project directory**. An agent with file-write access can edit that file
-> (and the `.maishac/` database) directly. If that matters, run the agent in a
-> sandbox that makes `.maishac/` read-only, or set the command with the flag or
-> the environment variable instead.
-
-## Teams & concurrency
-
-Project memory lives in a per-project SQLite file, `.maishac/memory.db`.
-
-- **Gitignore it.** It is local, machine-specific state, not source — add
-  `.maishac/` to `.gitignore` (this repo already does). To share state
-  deliberately, export a `compliance_report` (SARIF/JSON), don't commit the DB.
-- **Concurrent access.** The DB runs in WAL mode with a busy-timeout, so a CI
-  scan and a local session can read/write without hard-blocking. `session begin`
-  refuses to start a second session while one is already active on the same
-  project (pass `--force` to override) so two runs don't race on finding state.
-
-## Development
-
-```bash
-pip install -e ".[dev,mcp]" && python -m pytest tests/ -q   # MCP tests skip if the mcp extra is absent
-```
-
-`examples/bad.c` is a deliberately non-compliant fixture exercising ~18 rules —
-useful as a demo target.
-
-## Contributing
-
-Contributions are very welcome — especially to the community-extensible parts:
-adding a coding-standard **rule**, an authoring **pattern** (compliant idiom), or
-an **analyzer adapter** / SARIF-dialect mapping. None of these touch the engine.
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the how-to and the design invariants
-to preserve, and [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). Good first issues are
-labeled on the tracker.
-
-## License / disclaimer
-
-Rule summaries are **independent restatements written for this project**, not
-reproductions of any standard's text. Rule identifiers and categories are facts
-used to reference the guidelines; the wording is ours.
-
-MISRA® is a registered trademark of The MISRA Consortium Limited. BARR-C:2018 is
-copyright Barr Group (Integrated Embedded, LLC) and is named here as the source
-of those rule identifiers, as the standard invites tools that detect violations
-to do. SEI CERT® is a registered trademark of Carnegie Mellon University. None of
-these organisations endorse or are affiliated with Maisha.
-
-For normative wording, consult the official documents. Maisha output does not
-constitute a formal compliance certification.
+MISRA® is a registered trademark of The MISRA Consortium Limited. BARR-C:2018 is copyright Barr Group (Integrated Embedded, LLC) and is named here as the source of those rule identifiers, as the standard invites tools that detect violations to do. SEI CERT® is a registered trademark of Carnegie Mellon University. None of these organisations endorse or are affiliated with Maisha. Maisha output does not constitute a formal compliance certification.
