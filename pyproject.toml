@@ -32,7 +32,7 @@ Changelog = "https://github.com/WinterLabsHQ/maisha/blob/main/CHANGELOG.md"
 [project.optional-dependencies]
 # The MCP server is optional: scan/gate/report/sessions work without it.
 # Capped below 2: mcp 2.x removed `mcp.server.fastmcp`, which mcp_server.py uses.
-mcp = ["mcp>=1.2.0,<2"]
+mcp = ["mcp>=1.2.0,<3"]
 dev = ["pytest>=8", "hypothesis>=6", "jsonschema>=4", "pyyaml>=6", "tomli>=2; python_version < '3.11'"]
 
 [project.scripts]
